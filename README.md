@@ -46,12 +46,29 @@ The server speaks newline-delimited JSON-RPC on stdin/stdout, which matches curr
 
 ## MCP stdio config example
 
-Example configuration for an MCP client that launches the server from a virtualenv:
+If you installed the package into a virtualenv, point your MCP client at that virtualenv's `ssh-mcp` entrypoint. If you prefer, you can also launch it with `python -m ssh_mcp`.
+
+Example configuration for a generic stdio MCP client:
 
 ```json
 {
   "mcpServers": {
-    "ssh": {
+    "ssh-mcp": {
+      "type": "stdio",
+      "command": "/absolute/path/to/.venv/bin/ssh-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+If you want to launch via Python instead, use:
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp": {
+      "type": "stdio",
       "command": "/absolute/path/to/.venv/bin/python",
       "args": ["-m", "ssh_mcp"]
     }
@@ -64,9 +81,10 @@ If you want to point at a non-default SSH executable for testing, you can set:
 ```json
 {
   "mcpServers": {
-    "ssh": {
-      "command": "/absolute/path/to/.venv/bin/python",
-      "args": ["-m", "ssh_mcp"],
+    "ssh-mcp": {
+      "type": "stdio",
+      "command": "/absolute/path/to/.venv/bin/ssh-mcp",
+      "args": [],
       "env": {
         "SSH_MCP_SSH_BIN": "/absolute/path/to/ssh"
       }
@@ -81,6 +99,72 @@ Additional optional environment variables:
 - `SSH_MCP_SCP_BIN`: override the `scp` executable used by `ssh_scp`
 - `SSH_MCP_RSYNC_BIN`: override the `rsync` executable used by `ssh_sync`
 - `SSH_MCP_STATE_DIR`: override where session transcripts are stored. By default, the server uses `$XDG_STATE_HOME/ssh-mcp` when available, or `~/.local/state/ssh-mcp`.
+
+## Quick setup for common clients
+
+All examples below assume `ssh-mcp` is installed and available at an absolute path such as `/absolute/path/to/.venv/bin/ssh-mcp`.
+
+### GitHub Copilot CLI
+
+You can add the server interactively with `/mcp add`, choosing `STDIO`, or place it directly in `~/.copilot/mcp-config.json`:
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp": {
+      "type": "stdio",
+      "command": "/absolute/path/to/.venv/bin/ssh-mcp",
+      "args": [],
+      "env": {},
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+Project-specific Copilot CLI config can also live in `.vscode/mcp.json`.
+
+### Claude Code
+
+The easiest setup is the CLI:
+
+```bash
+claude mcp add --transport stdio --scope user ssh-mcp -- /absolute/path/to/.venv/bin/ssh-mcp
+```
+
+For a project-shared configuration, commit a `.mcp.json` file like:
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp": {
+      "command": "/absolute/path/to/.venv/bin/ssh-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
+```
+
+Use `claude mcp list` or `/mcp` inside Claude Code to confirm the server is available.
+
+### Codex CLI
+
+The easiest setup is:
+
+```bash
+codex mcp add ssh-mcp -- /absolute/path/to/.venv/bin/ssh-mcp
+```
+
+Or add it directly to `~/.codex/config.toml` (or `.codex/config.toml` for a trusted project):
+
+```toml
+[mcp_servers."ssh-mcp"]
+command = "/absolute/path/to/.venv/bin/ssh-mcp"
+args = []
+```
+
+Use `codex mcp list` or `/mcp` in the Codex TUI to verify it loaded.
 
 ## Tools
 

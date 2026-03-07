@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssh-mcp"
+version = "0.1.0"
+description = "A stdio MCP server that exposes Bash-like SSH execution and sessions."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = []
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Shells",
+    "Intended Audience :: Developers",
+]
+
+[project.scripts]
+ssh-mcp = "ssh_mcp.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

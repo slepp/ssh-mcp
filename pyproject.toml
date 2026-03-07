@@ -3,13 +3,14 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ssh-mcp"
+name = "slepp-ssh-mcp"
 version = "0.1.0"
 description = "A stdio MCP server that exposes Bash-like SSH execution and sessions."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = []
+keywords = ["mcp", "ssh", "scp", "rsync", "tmux"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -21,6 +22,11 @@ classifiers = [
     "Topic :: System :: Shells",
     "Intended Audience :: Developers",
 ]
+
+[project.urls]
+Homepage = "https://github.com/slepp/ssh-mcp"
+Repository = "https://github.com/slepp/ssh-mcp"
+Issues = "https://github.com/slepp/ssh-mcp/issues"
 
 [project.scripts]
 ssh-mcp = "ssh_mcp.__main__:main"

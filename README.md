@@ -22,6 +22,29 @@
 
 ## Installation
 
+### With uv (recommended)
+
+The PyPI distribution name is `slepp-ssh-mcp`, and it installs the `ssh-mcp` command.
+
+```bash
+uv tool install slepp-ssh-mcp
+ssh-mcp
+```
+
+To run it without installing a persistent tool:
+
+```bash
+uvx --from slepp-ssh-mcp ssh-mcp
+```
+
+Until the first PyPI release is live, you can run directly from GitHub:
+
+```bash
+uvx --from git+https://github.com/slepp/ssh-mcp ssh-mcp
+```
+
+### With pip
+
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
@@ -46,9 +69,37 @@ The server speaks newline-delimited JSON-RPC on stdin/stdout, which matches curr
 
 ## MCP stdio config example
 
+For a portable setup that does not depend on a fixed virtualenv path, use `uvx` with the published package:
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "slepp-ssh-mcp", "ssh-mcp"]
+    }
+  }
+}
+```
+
+Before the PyPI package exists, you can point `uvx` at the GitHub repo instead:
+
+```json
+{
+  "mcpServers": {
+    "ssh-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/slepp/ssh-mcp", "ssh-mcp"]
+    }
+  }
+}
+```
+
 If you installed the package into a virtualenv, point your MCP client at that virtualenv's `ssh-mcp` entrypoint. If you prefer, you can also launch it with `python -m ssh_mcp`.
 
-Example configuration for a generic stdio MCP client:
+Example configuration for a generic stdio MCP client using a virtualenv:
 
 ```json
 {
@@ -102,7 +153,7 @@ Additional optional environment variables:
 
 ## Quick setup for common clients
 
-All examples below assume `ssh-mcp` is installed and available at an absolute path such as `/absolute/path/to/.venv/bin/ssh-mcp`.
+All examples below use `uvx --from slepp-ssh-mcp ssh-mcp`. Until the first PyPI release is available, replace `slepp-ssh-mcp` with `git+https://github.com/slepp/ssh-mcp`.
 
 ### GitHub Copilot CLI
 
@@ -113,8 +164,8 @@ You can add the server interactively with `/mcp add`, choosing `STDIO`, or place
   "mcpServers": {
     "ssh-mcp": {
       "type": "stdio",
-      "command": "/absolute/path/to/.venv/bin/ssh-mcp",
-      "args": [],
+      "command": "uvx",
+      "args": ["--from", "slepp-ssh-mcp", "ssh-mcp"],
       "env": {},
       "tools": ["*"]
     }
@@ -129,7 +180,7 @@ Project-specific Copilot CLI config can also live in `.vscode/mcp.json`.
 The easiest setup is the CLI:
 
 ```bash
-claude mcp add --transport stdio --scope user ssh-mcp -- /absolute/path/to/.venv/bin/ssh-mcp
+claude mcp add --transport stdio --scope user ssh-mcp -- uvx --from slepp-ssh-mcp ssh-mcp
 ```
 
 For a project-shared configuration, commit a `.mcp.json` file like:
@@ -138,8 +189,9 @@ For a project-shared configuration, commit a `.mcp.json` file like:
 {
   "mcpServers": {
     "ssh-mcp": {
-      "command": "/absolute/path/to/.venv/bin/ssh-mcp",
-      "args": [],
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "slepp-ssh-mcp", "ssh-mcp"],
       "env": {}
     }
   }
@@ -153,18 +205,26 @@ Use `claude mcp list` or `/mcp` inside Claude Code to confirm the server is avai
 The easiest setup is:
 
 ```bash
-codex mcp add ssh-mcp -- /absolute/path/to/.venv/bin/ssh-mcp
+codex mcp add ssh-mcp -- uvx --from slepp-ssh-mcp ssh-mcp
 ```
 
 Or add it directly to `~/.codex/config.toml` (or `.codex/config.toml` for a trusted project):
 
 ```toml
 [mcp_servers."ssh-mcp"]
-command = "/absolute/path/to/.venv/bin/ssh-mcp"
-args = []
+command = "uvx"
+args = ["--from", "slepp-ssh-mcp", "ssh-mcp"]
 ```
 
 Use `codex mcp list` or `/mcp` in the Codex TUI to verify it loaded.
+
+## Publishing to PyPI
+
+This repository is set up to publish the `slepp-ssh-mcp` distribution through GitHub Actions Trusted Publishing.
+
+1. Create the `slepp-ssh-mcp` project on PyPI.
+2. Configure a Trusted Publisher for `slepp/ssh-mcp` and the `.github/workflows/publish.yml` workflow.
+3. Publish a GitHub release (or run the publish workflow manually) to upload the wheel and sdist.
 
 ## Tools
 

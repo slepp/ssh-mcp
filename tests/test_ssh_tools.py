@@ -287,7 +287,7 @@ class SshToolServiceTests(unittest.TestCase):
             {
                 "session_id": session_id,
                 "input": "exit 4\n",
-                "wait_seconds": 0.5,
+                "wait_seconds": 2.0,
                 "max_output_chars": 4096,
             }
         )
@@ -587,7 +587,7 @@ class SshToolServiceTests(unittest.TestCase):
         started = self.service.ssh_start_session({"target": "example", "observer_mode": "tmux"})
         session_id = started["session_id"]
         exited = self.service.ssh_write_session(
-            {"session_id": session_id, "input": "exit 0\n", "wait_seconds": 0.5, "max_output_chars": 4096}
+            {"session_id": session_id, "input": "exit 0\n", "wait_seconds": 5.0, "max_output_chars": 4096}
         )
         self.assertFalse(exited["running"])
         for _ in range(20):

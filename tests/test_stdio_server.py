@@ -164,10 +164,9 @@ class StdioServerTests(unittest.TestCase):
             }
         )
         session = session_call["result"]["structuredContent"]
-        self.assertIn("transcript_path", session)
         self.assertEqual(session["observer"]["mode"], "tmux")
         self.assertTrue(session["observer"]["tmux_started"])
-        self.assertTrue(Path(session["transcript_path"]).exists())
+        self.assertTrue(Path(session["observer"]["transcript_path"]).exists())
         log_entries = [json.loads(line) for line in self.tmux_log.read_text(encoding="utf-8").splitlines() if line]
         self.assertEqual(len(log_entries), 1)
 

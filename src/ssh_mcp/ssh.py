@@ -15,7 +15,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,7 @@ DEFAULT_SESSION_STOP_WAIT_SECONDS = 2.0
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ALLOWED_STRICT_HOST_KEY_CHECKING = {"yes", "no", "ask", "accept-new", "off"}
 _ALLOWED_OBSERVER_MODES = {"transcript", "tmux"}
+_EXIT_SIGNAL_NAMES = {9: "killed", 13: "broken-pipe", 15: "terminated"}
 
 
 class SshMcpError(Exception):
@@ -238,41 +239,25 @@ _BLOCKED_RSYNC_FLAGS = {"--rsh", "-e", "--rsync-path"}
 def _check_blocked_ssh_options(args: list[str], name: str) -> None:
     """Reject SSH -o options that would execute local commands."""
     for i, arg in enumerate(args):
-        # Match both "-o ProxyCommand=..." and "-oProxyCommand=..."
+        # Extract the option name from "-o Key=val" or "-oKey=val" forms.
+        raw_option: str | None = None
         if arg == "-o" and i + 1 < len(args):
-            option_name = args[i + 1].split("=", 1)[0].strip().lower()
-            if option_name in _BLOCKED_SSH_OPTIONS:
-                raise ValidationError(
-                    f"'{name}' contains blocked SSH option '{args[i + 1].split('=', 1)[0].strip()}'. "
-                    "This option can execute local commands and is not permitted via extra_ssh_args."
-                )
+            raw_option = args[i + 1]
         elif arg.startswith("-o") and len(arg) > 2:
-            option_value = arg[2:]
-            option_name = option_value.split("=", 1)[0].strip().lower()
-            if option_name in _BLOCKED_SSH_OPTIONS:
+            raw_option = arg[2:]
+        if raw_option is not None:
+            option_key = raw_option.split("=", 1)[0].strip()
+            if option_key.lower() in _BLOCKED_SSH_OPTIONS:
                 raise ValidationError(
-                    f"'{name}' contains blocked SSH option '{option_value.split('=', 1)[0].strip()}'. "
+                    f"'{name}' contains blocked SSH option '{option_key}'. "
                     "This option can execute local commands and is not permitted via extra_ssh_args."
                 )
 
 
 def _extra_ssh_args_argument(arguments: Mapping[str, Any], name: str = "extra_ssh_args") -> list[str]:
-    value = arguments.get(name)
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise ValidationError(f"'{name}' must be an array of strings.")
-    normalized: list[str] = []
-    for index, item in enumerate(value):
-        if not isinstance(item, str):
-            raise ValidationError(f"'{name}[{index}]' must be a string.")
-        if not item:
-            raise ValidationError(f"'{name}[{index}]' must not be empty.")
-        if "\x00" in item:
-            raise ValidationError(f"'{name}[{index}]' cannot contain NUL bytes.")
-        normalized.append(item)
-    _check_blocked_ssh_options(normalized, name)
-    return normalized
+    args = _string_list_argument(arguments, name, strip=False)
+    _check_blocked_ssh_options(args, name)
+    return args
 
 
 def _exclude_argument(arguments: Mapping[str, Any], name: str = "exclude") -> list[str]:
@@ -452,15 +437,16 @@ def _default_state_dir() -> Path:
     return Path.home() / ".local" / "state" / "ssh-mcp"
 
 
+def _slug(value: str, *, max_len: int = 30) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")[:max_len]
+
+
 def _sanitize_tmux_session_name(
     session_id: str,
     *,
     target: str | None = None,
     session_name: str | None = None,
 ) -> str:
-    def _slug(value: str) -> str:
-        return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")[:30]
-
     if session_name:
         label = _slug(session_name)
         if target:
@@ -787,7 +773,7 @@ class SshSession:
         self._total_output_chars = 0
         self._started_at = utcnow()
         self._ended_at: datetime | None = None
-        self._last_output_at: datetime | None = None
+        self._last_output_mono: float | None = None
         self._eof = False
         self._transcript_path = transcript_path
         self._transcript_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -800,7 +786,7 @@ class SshSession:
         self._transcript_file = os.fdopen(transcript_fd, "a", encoding="utf-8")
         self._configured_tmux_binary = tmux_binary
         self._observer_lock = threading.Lock()
-        self._observer_launching = False
+        self._tmux_launch_lock = threading.Lock()
         self._observer_stopping = False
         observer_script = Path(__file__).with_name("observe.py").resolve()
         observer_command = shlex.join(
@@ -853,10 +839,7 @@ class SshSession:
             return
         with self._observer_lock:
             self._observer.tmux_binary = tmux_binary
-            tmux_session_name = self._observer.tmux_session_name or _sanitize_tmux_session_name(
-                self.session_id, target=self.target, session_name=self.session_name,
-            )
-            self._observer.tmux_session_name = tmux_session_name
+            tmux_session_name = self._observer.tmux_session_name
         launch_argv = [
             tmux_binary,
             "new-session",
@@ -905,14 +888,15 @@ class SshSession:
         if observer_mode != "tmux":
             return
         with self._observer_lock:
-            if self._observer.tmux_started or self._observer_launching:
+            if self._observer.tmux_started:
                 return
-            self._observer_launching = True
-        try:
-            self._start_tmux_observer()
-        finally:
+        # Serialize launches: if another thread is launching, we block here
+        # until it finishes, then the inner check sees tmux_started = True.
+        with self._tmux_launch_lock:
             with self._observer_lock:
-                self._observer_launching = False
+                if self._observer.tmux_started:
+                    return
+            self._start_tmux_observer()
 
     def _observer_snapshot(self) -> dict[str, Any]:
         with self._observer_lock:
@@ -1029,7 +1013,7 @@ class SshSession:
         ``_unread_dropped_chars`` so callers can surface them to clients.
         """
         self._total_output_chars += len(text)
-        self._last_output_at = utcnow()
+        self._last_output_mono = time.monotonic()
         new_len = len(self._unread_output) + len(text)
         if new_len <= DEFAULT_UNREAD_BUFFER_CAP:
             self._unread_output += text
@@ -1061,18 +1045,19 @@ class SshSession:
         exit_reason: str | None = None
         if not running:
             if term_signal is not None:
-                _signal_names = {9: "killed", 13: "broken-pipe", 15: "terminated"}
-                exit_reason = _signal_names.get(term_signal, f"signal-{term_signal}")
+                exit_reason = _EXIT_SIGNAL_NAMES.get(term_signal, f"signal-{term_signal}")
             elif exit_code == 255:
                 exit_reason = "ssh-connection-failed"
             elif exit_code == 0:
                 exit_reason = "clean-exit"
             elif exit_code is not None:
                 exit_reason = f"exit-{exit_code}"
-        uptime_seconds = round((now - self._started_at).total_seconds(), 1) if running else None
+        end = now if running else (self._ended_at or now)
+        uptime_seconds = round((end - self._started_at).total_seconds(), 1)
+        mono_now = time.monotonic()
         idle_seconds = (
-            round((now - self._last_output_at).total_seconds(), 1)
-            if running and self._last_output_at is not None
+            round(mono_now - self._last_output_mono, 1)
+            if self._last_output_mono is not None
             else None
         )
         # Transcript file size for monitoring growth.
@@ -1099,7 +1084,10 @@ class SshSession:
             "output_dropped_chars": self._unread_dropped_chars,
             "started_at": format_timestamp(self._started_at),
             "ended_at": format_timestamp(self._ended_at),
-            "last_output_at": format_timestamp(self._last_output_at),
+            "last_output_at": format_timestamp(
+                now - timedelta(seconds=mono_now - self._last_output_mono)
+                if self._last_output_mono is not None else None
+            ),
             "uptime_seconds": uptime_seconds,
             "idle_seconds": idle_seconds,
             "pid": self.process.pid,
@@ -1127,10 +1115,9 @@ class SshSession:
         deadline = time.monotonic() + wait_seconds
         with self._condition:
             self._update_process_status_locked()
-            # When wait_for_new is True (used after write()) we always wait
-            # the full duration instead of returning stale buffered output
-            # immediately.  This ensures exit detection and command responses
-            # are captured after the write completes.
+            # wait_for_new suppresses the fast-path return on pre-existing
+            # buffered output so the caller sees output produced *after* the
+            # write, not stale data from before it.
             had_buffered_output = bool(self._unread_output) and not wait_for_new
             while True:
                 self._update_process_status_locked()
@@ -1230,6 +1217,7 @@ class SessionManager:
         self._sessions: dict[str, SshSession] = {}
         self._state_dir = state_dir
         self._tmux_binary = tmux_binary
+        self._last_prune_mono: float = 0.0
 
     def _prune_exited_locked(
         self,
@@ -1241,6 +1229,10 @@ class SessionManager:
         Sessions created with ``auto_close=True`` are pruned after the shorter
         *auto_close_age_seconds* (default 5 minutes).
         """
+        mono = time.monotonic()
+        if mono - self._last_prune_mono < 60:
+            return
+        self._last_prune_mono = mono
         now = utcnow()
         to_remove: list[str] = []
         for sid, session in self._sessions.items():

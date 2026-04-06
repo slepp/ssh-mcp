@@ -301,3 +301,51 @@ class StdioServerTests(unittest.TestCase):
         self.assertEqual(len(log_entries), 2)
         self.assertEqual(log_entries[0]["argv"][:3], ["new-session", "-d", "-s"])
         self.assertEqual(log_entries[1]["argv"][:2], ["kill-session", "-t"])
+
+    def test_stdio_forward_round_trip(self) -> None:
+        self._rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+
+        forward = self._rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "ssh_forward",
+                    "arguments": {
+                        "target": "example",
+                        "direction": "local",
+                        "local_port": 15555,
+                        "remote_host": "dbhost",
+                        "remote_port": 5432,
+                    },
+                },
+            }
+        )
+        content = forward["result"]
+        self.assertFalse(content["isError"])
+        structured = content["structuredContent"]
+        self.assertEqual(structured["direction"], "local")
+        forward_id = structured["forward_id"]
+
+        listing = self._rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "ssh_list_forwards", "arguments": {}},
+            }
+        )
+        self.assertFalse(listing["result"]["isError"])
+        self.assertEqual(listing["result"]["structuredContent"]["count"], 1)
+
+        stopped = self._rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "ssh_stop_forward", "arguments": {"forward_id": forward_id}},
+            }
+        )
+        self.assertFalse(stopped["result"]["isError"])
+        self.assertTrue(stopped["result"]["structuredContent"]["was_running"])

@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from . import __version__
-from .ssh import SessionNotFoundError, SshToolService, ValidationError
+from .ssh import ForwardNotFoundError, SessionNotFoundError, SshToolService, ValidationError
 
 SERVER_NAME = "ssh-mcp"
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2024-11-05")
@@ -378,6 +378,74 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "ssh_forward",
+        "description": (
+            "Start a dedicated SSH port forward (local or remote). This is a separate "
+            "tool from ssh_exec/ssh_start_session so MCP clients can permission-gate "
+            "port forwarding independently. Use direction 'local' to make a remote "
+            "service reachable on a local port, or 'remote' to expose a local service "
+            "on the remote host."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["target", "direction", "local_port", "remote_host", "remote_port"],
+            "properties": {
+                "target": {"type": "string", "description": "OpenSSH target such as host, alias, or user@host."},
+                "direction": {
+                    "type": "string",
+                    "enum": ["local", "remote"],
+                    "description": (
+                        "Forward direction. 'local' binds a local port that tunnels to a remote "
+                        "host:port. 'remote' binds a remote port that tunnels back to a local host:port."
+                    ),
+                },
+                "local_port": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "Port on the local side."},
+                "remote_host": {"type": "string", "description": "Destination host from the SSH server's perspective."},
+                "remote_port": {"type": "integer", "minimum": 1, "maximum": 65535, "description": "Destination port."},
+                "bind_address": {
+                    "type": "string",
+                    "description": (
+                        "Address to bind on. Default: 127.0.0.1. Set to 0.0.0.0 to expose on "
+                        "all interfaces (use with caution)."
+                    ),
+                },
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "identity_file": {"type": "string"},
+                "known_hosts_file": {"type": "string"},
+                "strict_host_key_checking": _STRICT_HOST_KEY_CHECKING_SCHEMA,
+                "extra_ssh_args": _EXTRA_SSH_ARGS_SCHEMA,
+            },
+        },
+    },
+    {
+        "name": "ssh_list_forwards",
+        "description": (
+            "List tracked SSH port forwards with their forward_id, direction, ports, "
+            "target, and running status."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "include_stopped": {"type": "boolean", "description": "Include forwards that have exited. Default: false."},
+                "target": {"type": "string", "description": "Filter by SSH target."},
+            },
+        },
+    },
+    {
+        "name": "ssh_stop_forward",
+        "description": "Stop a tracked SSH port forward and return its final status.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["forward_id"],
+            "properties": {
+                "forward_id": {"type": "string", "description": "ID of the forward to stop."},
+            },
+        },
+    },
 ]
 
 
@@ -403,6 +471,9 @@ class McpServer:
             "ssh_write_session": self._tool_service.ssh_write_session,
             "ssh_stop_session": self._tool_service.ssh_stop_session,
             "ssh_list_sessions": self._tool_service.ssh_list_sessions,
+            "ssh_forward": self._tool_service.ssh_forward,
+            "ssh_list_forwards": self._tool_service.ssh_list_forwards,
+            "ssh_stop_forward": self._tool_service.ssh_stop_forward,
         }
 
     def serve(self) -> None:
@@ -558,6 +629,8 @@ class McpServer:
             return _tool_error(str(exc), error_type="validation_error")
         except SessionNotFoundError as exc:
             return _tool_error(str(exc), error_type="session_not_found")
+        except ForwardNotFoundError as exc:
+            return _tool_error(str(exc), error_type="forward_not_found")
         except Exception as exc:  # pragma: no cover - defensive fallback
             print(traceback.format_exc(), file=sys.stderr, flush=True)
             return _tool_error(f"Internal tool error: {exc}", error_type="internal_error")

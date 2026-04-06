@@ -1,89 +1,51 @@
 # ssh-mcp
 
-`ssh-mcp` is a stdio MCP server that wraps the local OpenSSH client and exposes remote execution plus interactive SSH sessions that feel close to a Bash tool.
+An MCP server that gives AI agents SSH access to remote machines through your local OpenSSH client. It wraps `ssh`, `scp`, and `rsync` so agents can run remote commands, transfer files, maintain persistent shell sessions, and set up port forwards — all using your existing SSH config, keys, and credentials.
 
-## Features
+## Why ssh-mcp?
 
-- Pure-stdlib Python runtime; no third-party runtime dependencies.
-- Uses the local `ssh` binary, so host aliases, SSH config, `ProxyJump`, SSH agent forwarding, and existing credentials work naturally.
-- Newline-delimited JSON-RPC 2.0 over stdio for MCP clients.
-- One-off remote command execution with optional remote `cwd`, `env`, shell selection, timeout, TTY, and SSH connection flags.
-- Persistent interactive SSH sessions backed by a local PTY.
-- Stable session reuse with `ssh_ensure_session` so long-lived agent workflows can keep using the same shell instead of accidentally starting duplicates.
-- Passive session observation via per-session transcripts and optional detached tmux viewers.
-- Structured tool responses that are easy for an LLM to consume.
+- **Uses your local SSH** — host aliases, `~/.ssh/config`, `ProxyJump`, agent forwarding, and existing credentials all work naturally. No SSH libraries or key management.
+- **Persistent sessions** — agents can keep a shell open across multiple tool calls, just like a human would. Sessions survive context window resets when you give them a `session_name`.
+- **Observable** — every session records a transcript and optionally launches a detached tmux viewer so you can watch what the agent is doing in real time.
+- **Permission-gatable** — port forwarding is a separate tool from command execution, so MCP clients can allow SSH access without allowing port forwards.
+- **Pure Python** — no third-party runtime dependencies. Runs anywhere Python 3.10+ and OpenSSH are available.
 
 ## Requirements
 
 - Python 3.10+
-- OpenSSH client available as `ssh` and `scp` on `PATH` (or via `SSH_MCP_SSH_BIN` / `SSH_MCP_SCP_BIN`)
-- `rsync` available on `PATH` (or via `SSH_MCP_RSYNC_BIN`) when you want incremental sync support
-- `tmux` is optional; it is only needed when you want the server to auto-launch a detached live observer.
+- `ssh` and `scp` on PATH (or set `SSH_MCP_SSH_BIN` / `SSH_MCP_SCP_BIN`)
+- `rsync` on PATH (or set `SSH_MCP_RSYNC_BIN`) — only needed for `ssh_sync`
+- `tmux` — optional, for live session observation
 
 ## Installation
 
 ### With uv (recommended)
 
-The PyPI distribution name is `slepp-ssh-mcp`, and it installs the `ssh-mcp` command.
-
-```bash
-uv tool install slepp-ssh-mcp
-ssh-mcp
-```
-
-To run it without installing a persistent tool:
-
-```bash
-uvx --from slepp-ssh-mcp ssh-mcp
-```
-
-Until the first PyPI release is live, you can run directly from GitHub:
-
 ```bash
 uvx --from git+https://github.com/slepp/ssh-mcp ssh-mcp
+```
+
+Or install persistently:
+
+```bash
+uv tool install git+https://github.com/slepp/ssh-mcp
 ```
 
 ### With pip
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e .
+pip install git+https://github.com/slepp/ssh-mcp
 ```
 
-## Running the server
+## Setup
 
-After installation, run either of these:
+### Claude Code
 
 ```bash
-python -m ssh_mcp
+claude mcp add --transport stdio --scope user ssh-mcp -- uvx --from git+https://github.com/slepp/ssh-mcp ssh-mcp
 ```
 
-or
-
-```bash
-ssh-mcp
-```
-
-The server speaks newline-delimited JSON-RPC on stdin/stdout, which matches current MCP stdio transport guidance.
-
-## MCP stdio config example
-
-For a portable setup that does not depend on a fixed virtualenv path, use `uvx` with the published package:
-
-```json
-{
-  "mcpServers": {
-    "ssh-mcp": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": ["--from", "slepp-ssh-mcp", "ssh-mcp"]
-    }
-  }
-}
-```
-
-Before the PyPI package exists, you can point `uvx` at the GitHub repo instead:
+Or commit a `.mcp.json` to share with your team:
 
 ```json
 {
@@ -97,365 +59,236 @@ Before the PyPI package exists, you can point `uvx` at the GitHub repo instead:
 }
 ```
 
-If you installed the package into a virtualenv, point your MCP client at that virtualenv's `ssh-mcp` entrypoint. If you prefer, you can also launch it with `python -m ssh_mcp`.
-
-Example configuration for a generic stdio MCP client using a virtualenv:
-
-```json
-{
-  "mcpServers": {
-    "ssh-mcp": {
-      "type": "stdio",
-      "command": "/absolute/path/to/.venv/bin/ssh-mcp",
-      "args": []
-    }
-  }
-}
-```
-
-If you want to launch via Python instead, use:
-
-```json
-{
-  "mcpServers": {
-    "ssh-mcp": {
-      "type": "stdio",
-      "command": "/absolute/path/to/.venv/bin/python",
-      "args": ["-m", "ssh_mcp"]
-    }
-  }
-}
-```
-
-If you want to point at a non-default SSH executable for testing, you can set:
-
-```json
-{
-  "mcpServers": {
-    "ssh-mcp": {
-      "type": "stdio",
-      "command": "/absolute/path/to/.venv/bin/ssh-mcp",
-      "args": [],
-      "env": {
-        "SSH_MCP_SSH_BIN": "/absolute/path/to/ssh"
-      }
-    }
-  }
-}
-```
-
-Additional optional environment variables:
-
-- `SSH_MCP_TMUX_BIN`: override the `tmux` executable used for observer panes
-- `SSH_MCP_SCP_BIN`: override the `scp` executable used by `ssh_scp`
-- `SSH_MCP_RSYNC_BIN`: override the `rsync` executable used by `ssh_sync`
-- `SSH_MCP_STATE_DIR`: override where session transcripts are stored. By default, the server uses `$XDG_STATE_HOME/ssh-mcp` when available, or `~/.local/state/ssh-mcp`.
-
-## Quick setup for common clients
-
-All examples below use `uvx --from slepp-ssh-mcp ssh-mcp`. Until the first PyPI release is available, replace `slepp-ssh-mcp` with `git+https://github.com/slepp/ssh-mcp`.
-
-### GitHub Copilot CLI
-
-You can add the server interactively with `/mcp add`, choosing `STDIO`, or place it directly in `~/.copilot/mcp-config.json`:
-
-```json
-{
-  "mcpServers": {
-    "ssh-mcp": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": ["--from", "slepp-ssh-mcp", "ssh-mcp"],
-      "env": {},
-      "tools": ["*"]
-    }
-  }
-}
-```
-
-Project-specific Copilot CLI config can also live in `.vscode/mcp.json`.
-
-### Claude Code
-
-The easiest setup is the CLI:
-
-```bash
-claude mcp add --transport stdio --scope user ssh-mcp -- uvx --from slepp-ssh-mcp ssh-mcp
-```
-
-For a project-shared configuration, commit a `.mcp.json` file like:
-
-```json
-{
-  "mcpServers": {
-    "ssh-mcp": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": ["--from", "slepp-ssh-mcp", "ssh-mcp"],
-      "env": {}
-    }
-  }
-}
-```
-
-Use `claude mcp list` or `/mcp` inside Claude Code to confirm the server is available.
-
 ### Codex CLI
 
-The easiest setup is:
-
 ```bash
-codex mcp add ssh-mcp -- uvx --from slepp-ssh-mcp ssh-mcp
+codex mcp add ssh-mcp -- uvx --from git+https://github.com/slepp/ssh-mcp ssh-mcp
 ```
 
-Or add it directly to `~/.codex/config.toml` (or `.codex/config.toml` for a trusted project):
+### GitHub Copilot
 
-```toml
-[mcp_servers."ssh-mcp"]
-command = "uvx"
-args = ["--from", "slepp-ssh-mcp", "ssh-mcp"]
-```
-
-Use `codex mcp list` or `/mcp` in the Codex TUI to verify it loaded.
-
-## Publishing to PyPI
-
-This repository is set up to publish the `slepp-ssh-mcp` distribution through GitHub Actions Trusted Publishing.
-
-1. Create the `slepp-ssh-mcp` project on PyPI.
-2. Configure a Trusted Publisher for `slepp/ssh-mcp` and the `.github/workflows/publish.yml` workflow.
-3. Publish a GitHub release (or run the publish workflow manually) to upload the wheel and sdist.
-
-## Tools
-
-### `ssh_exec`
-
-Run a one-off remote command.
-
-Arguments:
-
-- `target` *(required)*: SSH destination such as `prod`, `user@host`, or a host alias from `~/.ssh/config`
-- `command` *(required)*: remote command string
-- `cwd`: remote directory to `cd` into before running the command
-- `env`: object of remote environment variables to export first
-- `shell`: remote shell executable used to wrap the command when needed
-- `timeout`: local timeout in seconds
-- `tty`: request a TTY with `-tt`
-- `port`
-- `identity_file`
-- `known_hosts_file`
-- `strict_host_key_checking`
-- `extra_ssh_args`
-
-### `ssh_scp`
-
-Copy files or directories between the local machine and one remote target via `scp`.
-
-Arguments:
-
-- `target` *(required)*
-- `direction` *(required)*: `upload` or `download`
-- `sources` *(required)*: one or more source paths
-- `destination` *(required)*
-- `recursive`
-- `preserve_times`
-- `timeout`
-- `port`
-- `identity_file`
-- `known_hosts_file`
-- `strict_host_key_checking`
-- `extra_ssh_args`
-
-### `ssh_sync`
-
-Incrementally sync files or directories between the local machine and one remote target via `rsync` over SSH.
-
-Arguments:
-
-- `target` *(required)*
-- `direction` *(required)*: `upload` or `download`
-- `source` *(required)*
-- `destination` *(required)*
-- `delete`
-- `compress` *(defaults to `true`)*
-- `dry_run`
-- `exclude`
-- `timeout`
-- `extra_rsync_args`
-- `port`
-- `identity_file`
-- `known_hosts_file`
-- `strict_host_key_checking`
-- `extra_ssh_args`
-
-### `ssh_start_session`
-
-Start a persistent interactive SSH session attached to a local PTY and return a session id plus initial unread output.
-
-Arguments:
-
-- `target` *(required)*
-- `session_name`: optional stable identifier for this session
-- `cwd`
-- `env`
-- `shell`
-- `observer_mode`: `tmux` (default, with transcript fallback if tmux is unavailable) or `transcript`
-- `wait_seconds`
-- `max_output_chars`
-- `port`
-- `identity_file`
-- `known_hosts_file`
-- `strict_host_key_checking`
-- `extra_ssh_args`
-
-If you are building a long-lived workflow, prefer `ssh_ensure_session` below.
-
-### `ssh_ensure_session`
-
-Reuse an existing running SSH session or start one if needed.
-
-This is the safest tool for multi-step agent workflows because it lets the client recover the same shell even if it forgot the last `session_id`.
-
-Matching rules:
-
-- If `session_name` is provided, the server reuses the running session with the same `target` + `session_name`
-- Otherwise, it reuses a session only when there is exactly one running session for that `target`
-- If the target is ambiguous, the tool returns an error instead of silently picking the wrong session
-
-Arguments:
-
-- `target` *(required)*
-- `session_name`: recommended stable identifier such as `deploy-shell` or `main`
-- `cwd`
-- `env`
-- `shell`
-- `observer_mode`
-- `wait_seconds`
-- `max_output_chars`
-- `port`
-- `identity_file`
-- `known_hosts_file`
-- `strict_host_key_checking`
-- `extra_ssh_args`
-
-### `ssh_read_session`
-
-Read unread output from a tracked session.
-
-Arguments:
-
-- `session_id` *(required)*
-- `wait_seconds`
-- `max_output_chars`
-
-### `ssh_write_session`
-
-Write raw input to a session PTY and optionally wait for more output.
-
-Arguments:
-
-- `session_id` *(required)*
-- `input` *(required, may include control characters like `\u0003` or trailing newlines)*
-- `wait_seconds`
-- `max_output_chars`
-
-### `ssh_stop_session`
-
-Terminate a session, close any detached tmux observer for it, and return final metadata plus remaining unread output.
-
-Arguments:
-
-- `session_id` *(required)*
-- `force`
-- `wait_seconds`
-- `max_output_chars`
-
-### `ssh_list_sessions`
-
-List tracked running and exited sessions.
-
-Arguments:
-
-- `include_exited` (defaults to `true`)
-- `target`: optional filter
-- `session_name`: optional filter
-
-## Watching a session as an observer
-
-Every interactive session now records a transcript file and returns:
-
-- `transcript_path`: local file path for the session transcript
-- `observer_command`: a local command that tails the transcript with the bundled observer helper
-- `observer`: a structured object containing transcript and optional tmux metadata
-
-By default, interactive sessions try to launch a detached tmux observer and fall back to transcript-only observation if tmux is unavailable.
-
-If you start a session with `observer_mode: "tmux"` or leave the default in place and tmux is available, the server also launches a detached tmux session and returns:
-
-- `observer.tmux_session_name`
-- `observer.tmux_attach_command`
-
-If you prefer not to launch tmux, set `observer_mode: "transcript"` explicitly.
-
-### Example observer workflow
-
-1. Start a session with:
-
-   ```json
-   {
-      "target": "prod-shell",
-      "session_name": "main",
-      "observer_mode": "tmux"
-    }
-    ```
-
-2. Copy the returned `observer.tmux_attach_command` into a local terminal.
-3. Watch the session in tmux while the MCP client continues to control the SSH PTY.
-4. If you do not want tmux, run the returned `observer_command` instead for a plain transcript follower.
-
-Observer behavior and cleanup notes:
-
-- Each tracked session gets exactly one transcript file. `ssh_ensure_session` reuses the existing session and does not launch duplicate tmux observers for it.
-- Detached tmux observers are tied to the tracked session lifecycle: `ssh_stop_session` closes them, and the MCP server also closes them automatically when the stdio client disconnects and the server shuts down.
-- The server also force-stops tracked SSH sessions during shutdown, but transcript files are intentionally left on disk for later inspection until you delete them from the state directory yourself.
-- If tmux is unavailable or a tmux launch/cleanup step fails, the tool still returns transcript-based observer details plus a warning.
-
-## Recommended agent pattern
-
-For sustained work on one host, use a stable `session_name` and call `ssh_ensure_session` at the start of each new step:
+Add to `~/.copilot/mcp-config.json` (or `.vscode/mcp.json` per-project):
 
 ```json
 {
-  "target": "prod-shell",
-  "session_name": "main",
-  "observer_mode": "tmux"
+  "mcpServers": {
+    "ssh-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/slepp/ssh-mcp", "ssh-mcp"]
+    }
+  }
 }
 ```
 
-That gives the model an idempotent "get me the working shell" operation, which is much safer than calling `ssh_start_session` repeatedly.
+### Generic MCP client
 
-## Notes
+Any stdio MCP client works. Point it at `uvx --from slepp-ssh-mcp ssh-mcp` or at a virtualenv's `ssh-mcp` entrypoint.
 
-- The server inherits your local environment when launching `ssh`, so SSH config, `SSH_AUTH_SOCK`, and related OpenSSH behavior are preserved.
-- `cwd`, `env`, and `shell` wrappers assume a POSIX-like shell exists on the remote side.
-- Interactive sessions intentionally use a PTY, so command echo and terminal formatting may appear in output just like a terminal session.
-- Session transcripts may contain sensitive command output, so choose `SSH_MCP_STATE_DIR` appropriately and clean up persisted transcript files when you no longer need them.
+## How it works
 
-## License
+ssh-mcp runs as a stdio process that your MCP client spawns. It receives JSON-RPC tool calls and translates them into local `ssh`/`scp`/`rsync` commands. Because it uses your local SSH binary, everything in your `~/.ssh/config` works — jump hosts, custom ports, key selection, `SSH_AUTH_SOCK`, proxy commands.
 
-This project is licensed under the MIT License. See `LICENSE`.
+There are three modes of operation:
 
-## Development and CI
+### One-off commands (`ssh_exec`)
 
-The public CI workflow runs these checks:
+Run a command, get stdout/stderr/exit code back. Works like `ssh host 'command'`.
 
-```bash
-python3 -m unittest discover -s tests -v
-python3 -m compileall src
-python3 -m build
+```json
+{
+  "target": "prod-web01",
+  "command": "systemctl status nginx",
+  "timeout": 10
+}
 ```
 
-To mirror CI locally, install the build frontend once and run:
+Use `cwd` to set the working directory, `env` to export variables, and `tty: true` for commands that need a terminal (like `sudo` with a password prompt). Note that `tty` merges stdout and stderr.
+
+### Interactive sessions (`ssh_ensure_session` + `ssh_write_session` + `ssh_read_session`)
+
+For multi-step work, open a persistent shell. The agent writes commands and reads output just like typing in a terminal.
+
+**Start or reuse a session:**
+
+```json
+{
+  "target": "prod-web01",
+  "session_name": "deploy-api"
+}
+```
+
+Always use a descriptive `session_name`. It serves three purposes:
+1. The agent can find the same session across multiple tool calls
+2. The tmux observer window gets a human-readable name (e.g., `ssh-mcp-prod-web01-deploy-api`)
+3. A different agent or conversation can recover the session by name
+
+**Write a command:**
+
+```json
+{
+  "session_id": "a1b2c3d4e5f6",
+  "input": "cd /app && git pull\n",
+  "wait_seconds": 5
+}
+```
+
+Always include `\n` to press Enter. Use `\u0003` for Ctrl-C, `\u0004` for Ctrl-D. Set `wait_seconds` high enough for the command to produce output (default: 1 second).
+
+**Read more output:**
+
+```json
+{
+  "session_id": "a1b2c3d4e5f6",
+  "wait_seconds": 10
+}
+```
+
+Check `pending_output_chars` in the response — if non-zero, call again to drain the buffer.
+
+**Session lifecycle:**
+- `ssh_ensure_session` is idempotent — call it at the start of each step
+- Sessions auto-detect dead connections via SSH keepalive (~90 seconds)
+- Response includes `uptime_seconds`, `idle_seconds`, and `exit_reason` for health monitoring
+- Use `auto_close: true` for one-shot commands that should clean up when done
+- Exited sessions are pruned from memory after 1 hour (5 minutes for `auto_close`)
+- `cwd`, `env`, and `shell` only apply when creating a new session — they are ignored when reusing an existing one
+
+### File transfer (`ssh_scp`, `ssh_sync`)
+
+Copy files between local and remote machines.
+
+**scp** — simple file/directory copy:
+
+```json
+{
+  "target": "prod-web01",
+  "direction": "upload",
+  "sources": ["/local/path/app.tar.gz"],
+  "destination": "/tmp/"
+}
+```
+
+For `upload`, `sources` are local paths and `destination` is remote. For `download`, it's reversed. The `target` parameter specifies the host — don't include the host in `sources` or `destination`.
+
+**rsync** — incremental sync with `--delete` and `--exclude`:
+
+```json
+{
+  "target": "prod-web01",
+  "direction": "upload",
+  "source": "./dist/",
+  "destination": "/var/www/app/",
+  "delete": true,
+  "exclude": ["*.log", ".git"]
+}
+```
+
+### Port forwarding (`ssh_forward`)
+
+Create local or remote port forwards. This is a separate tool from `ssh_exec` so MCP clients can grant SSH access without granting port forwarding.
+
+**Local forward** — make a remote service reachable locally:
+
+```json
+{
+  "target": "prod-web01",
+  "direction": "local",
+  "local_port": 15432,
+  "remote_host": "prod-db.internal",
+  "remote_port": 5432
+}
+```
+
+This binds `localhost:15432` and tunnels it to `prod-db.internal:5432` through `prod-web01`.
+
+**Remote forward** — expose a local service on the remote host:
+
+```json
+{
+  "target": "prod-web01",
+  "direction": "remote",
+  "local_port": 3000,
+  "remote_host": "localhost",
+  "remote_port": 8080
+}
+```
+
+Forwards bind to `127.0.0.1` by default. Set `bind_address: "0.0.0.0"` to expose on all interfaces (use with caution).
+
+Use `ssh_list_forwards` to see active forwards and `ssh_stop_forward` to tear them down.
+
+## Watching sessions
+
+Every interactive session records a transcript to `~/.local/state/ssh-mcp/<session_id>/transcript.log`.
+
+By default, sessions also launch a detached tmux window so you can watch in real time. The tmux session name includes the target and session name for easy identification:
+
+```bash
+# List ssh-mcp tmux sessions
+tmux ls | grep ssh-mcp
+
+# Attach to watch
+tmux attach -t ssh-mcp-prod-web01-deploy-api
+```
+
+If you prefer not to use tmux, set `observer_mode: "transcript"` and tail the transcript file directly — the response includes an `observer_command` you can copy-paste.
+
+The tmux observer is tied to the session lifecycle: stopping a session closes its tmux window. The MCP server also cleans up tmux on shutdown.
+
+## Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SSH_MCP_SSH_BIN` | `ssh` | Path to the SSH client |
+| `SSH_MCP_SCP_BIN` | `scp` | Path to the SCP client |
+| `SSH_MCP_RSYNC_BIN` | `rsync` | Path to rsync |
+| `SSH_MCP_TMUX_BIN` | `tmux` | Path to tmux |
+| `SSH_MCP_STATE_DIR` | `~/.local/state/ssh-mcp` | Where transcripts are stored |
+
+## Security
+
+ssh-mcp is designed for single-developer use on your own machine. It runs SSH commands as your user with your credentials.
+
+**What's protected:**
+- Port forwarding flags (`-L`, `-R`, `-D`, `-W`) and dangerous SSH options (`ProxyCommand`, `LocalCommand`, `LocalForward`, `RemoteForward`, `DynamicForward`) are blocked in `extra_ssh_args`. The only way to create forwards is through the explicit `ssh_forward` tool, which MCP clients can permission-gate.
+- Transcript files are created with mode `0600` and the state directory with `0700`.
+- All command arguments use `shlex.quote()` to prevent shell injection. Subprocess calls use list arguments, never `shell=True`.
+- Environment variable names are validated against `^[A-Za-z_][A-Za-z0-9_]*$`.
+
+**What's not protected:**
+- An agent with `ssh_exec` access can run arbitrary commands on any host your SSH config can reach. The security boundary is SSH itself (keys, known_hosts).
+- Transcript files persist on disk after sessions end and may contain secrets (passwords typed at sudo prompts, API keys in output). Clean up `SSH_MCP_STATE_DIR` when you no longer need them.
+- The `shell` parameter lets agents choose any remote executable. This is by design — the tool is for remote execution.
+
+## Known limitations
+
+- **POSIX-only remotes** — `cwd`, `env`, and `shell` wrapping assumes a POSIX shell on the remote side. Windows SSH targets need commands written for their shell.
+- **PTY output** — interactive sessions use a PTY, so output includes terminal formatting (ANSI escape codes, command echo, line wrapping). This is intentional — it matches what a human would see.
+- **No multiplexing** — each `ssh_exec` call opens a new SSH connection. If your agent runs many rapid commands to the same host, consider using a session instead, or configure `ControlMaster` in your `~/.ssh/config`.
+- **Transcript growth** — transcripts grow without bound for long-running sessions. The response includes `transcript_size_bytes` so you can monitor this. Restart the session if it gets too large.
+- **Forward connections are standalone** — each `ssh_forward` opens its own SSH connection. Forwards are not tied to sessions.
+
+## Tools reference
+
+| Tool | Description |
+|------|-------------|
+| `ssh_exec` | Run a one-off remote command |
+| `ssh_scp` | Copy files via scp |
+| `ssh_sync` | Incremental sync via rsync |
+| `ssh_start_session` | Start a new interactive session |
+| `ssh_ensure_session` | Reuse or start an interactive session (recommended) |
+| `ssh_read_session` | Read output from a session |
+| `ssh_write_session` | Write input to a session |
+| `ssh_stop_session` | Stop a session |
+| `ssh_list_sessions` | List tracked sessions |
+| `ssh_forward` | Start a port forward |
+| `ssh_list_forwards` | List tracked forwards |
+| `ssh_stop_forward` | Stop a port forward |
+
+All session and forward tools accept standard SSH connection parameters: `port`, `identity_file`, `known_hosts_file`, `strict_host_key_checking`, and `extra_ssh_args`.
+
+## Development
 
 ```bash
 python3 -m pip install build
@@ -464,9 +297,6 @@ python3 -m compileall src
 python3 -m build
 ```
 
-Optional manual smoke checks:
+## License
 
-- Start the MCP server from your MCP client or with `python -m ssh_mcp`
-- Open a session with `ssh_ensure_session` and `observer_mode: "tmux"`
-- Attach using `observer.tmux_attach_command` or follow the transcript with `observer_command`
-- Reuse the same `target` + `session_name` a few times and confirm the same shell state is preserved
+MIT. See `LICENSE`.

@@ -45,6 +45,10 @@ class SessionNotFoundError(SshMcpError):
     """Raised when a session id is unknown."""
 
 
+class ForwardNotFoundError(SshMcpError):
+    """Raised when a forward id is unknown."""
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -235,10 +239,17 @@ _BLOCKED_SSH_OPTIONS = {
 # rsync flags that execute local commands or override the transport.
 _BLOCKED_RSYNC_FLAGS = {"--rsh", "-e", "--rsync-path"}
 
+_BLOCKED_SSH_SHORT_FLAGS = {"-L", "-R", "-D", "-W"}
+
 
 def _check_blocked_ssh_options(args: list[str], name: str) -> None:
     """Reject SSH -o options that would execute local commands."""
     for i, arg in enumerate(args):
+        if arg in _BLOCKED_SSH_SHORT_FLAGS:
+            raise ValidationError(
+                f"'{name}' contains blocked SSH flag '{arg}'. "
+                "Use the ssh_forward tool for port forwarding."
+            )
         # Extract the option name from "-o Key=val" or "-oKey=val" forms.
         raw_option: str | None = None
         if arg == "-o" and i + 1 < len(args):
@@ -739,6 +750,162 @@ def _normalize_local_destination(path: str, *, require_directory: bool = False) 
     if not parent.exists():
         raise ValidationError(f"Parent directory for local destination does not exist: {parent}")
     return expanded
+
+
+@dataclass
+class ForwardEntry:
+    forward_id: str
+    target: str
+    direction: str
+    local_port: int
+    remote_host: str
+    remote_port: int
+    bind_address: str
+    process: subprocess.Popen[Any]
+    argv: list[str]
+    started_at: datetime
+
+    def summary(self) -> dict[str, Any]:
+        return_code = self.process.poll()
+        exit_code, term_signal = _split_return_code(return_code)
+        running = return_code is None
+        now = utcnow()
+        uptime_seconds = round(
+            (now - self.started_at).total_seconds(), 1
+        ) if running else None
+        return {
+            "forward_id": self.forward_id,
+            "target": self.target,
+            "direction": self.direction,
+            "local_port": self.local_port,
+            "remote_host": self.remote_host,
+            "remote_port": self.remote_port,
+            "bind_address": self.bind_address,
+            "running": running,
+            "pid": self.process.pid,
+            "return_code": return_code,
+            "exit_code": exit_code,
+            "signal": term_signal,
+            "uptime_seconds": uptime_seconds,
+            "started_at": format_timestamp(self.started_at),
+            "ssh_argv": list(self.argv),
+            "ssh_command": shlex.join(self.argv),
+        }
+
+
+DEFAULT_FORWARD_STARTUP_WAIT = 0.5
+
+
+class ForwardManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._forwards: dict[str, ForwardEntry] = {}
+
+    def _allocate_forward_id(self) -> str:
+        while True:
+            forward_id = uuid.uuid4().hex[:12]
+            if forward_id not in self._forwards:
+                return forward_id
+
+    def start(
+        self,
+        *,
+        target: str,
+        direction: str,
+        local_port: int,
+        remote_host: str,
+        remote_port: int,
+        bind_address: str,
+        argv: list[str],
+    ) -> ForwardEntry:
+        with self._lock:
+            forward_id = self._allocate_forward_id()
+            process = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            entry = ForwardEntry(
+                forward_id=forward_id,
+                target=target,
+                direction=direction,
+                local_port=local_port,
+                remote_host=remote_host,
+                remote_port=remote_port,
+                bind_address=bind_address,
+                process=process,
+                argv=list(argv),
+                started_at=utcnow(),
+            )
+            self._forwards[forward_id] = entry
+        return entry
+
+    def get(self, forward_id: str) -> ForwardEntry:
+        if not isinstance(forward_id, str) or not forward_id.strip():
+            raise ValidationError("'forward_id' must be a non-empty string.")
+        with self._lock:
+            entry = self._forwards.get(forward_id)
+        if entry is None:
+            raise ForwardNotFoundError(f"Unknown forward_id '{forward_id}'.")
+        return entry
+
+    def list_forwards(
+        self,
+        *,
+        include_stopped: bool = False,
+        target: str | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            entries = list(self._forwards.values())
+        summaries = []
+        for entry in entries:
+            summary = entry.summary()
+            if not include_stopped and not summary["running"]:
+                continue
+            if target is not None and summary["target"] != target:
+                continue
+            summaries.append(summary)
+        return {"count": len(summaries), "forwards": summaries}
+
+    def _close_pipes(self, entry: ForwardEntry) -> None:
+        for pipe in (entry.process.stdout, entry.process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+
+    def stop(self, forward_id: str) -> dict[str, Any]:
+        entry = self.get(forward_id)
+        was_running = entry.process.poll() is None
+        forced_kill = False
+        termination_signal = None
+        if was_running:
+            termination_signal = "SIGTERM"
+            forced_kill = _terminate_process_group(
+                entry.process, grace_period=DEFAULT_SESSION_STOP_WAIT_SECONDS,
+            )
+            if forced_kill:
+                termination_signal = "SIGKILL"
+        self._close_pipes(entry)
+        summary = entry.summary()
+        summary["was_running"] = was_running
+        summary["termination_signal"] = termination_signal
+        summary["forced_kill"] = forced_kill
+        return summary
+
+    def close(self) -> None:
+        with self._lock:
+            entries = list(self._forwards.values())
+        for entry in entries:
+            try:
+                if entry.process.poll() is None:
+                    _terminate_process_group(entry.process, grace_period=0.5)
+                self._close_pipes(entry)
+            except Exception:
+                continue
 
 
 class SshSession:
@@ -1431,8 +1598,10 @@ class SshToolService:
         self._state_dir = Path(state_dir).expanduser() if state_dir is not None else _default_state_dir()
         self._state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._sessions = SessionManager(state_dir=self._state_dir, tmux_binary=self._configured_tmux_binary)
+        self._forwards = ForwardManager()
 
     def close(self) -> None:
+        self._forwards.close()
         self._sessions.close()
 
     def ssh_exec(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -1709,3 +1878,61 @@ class SshToolService:
             target=target,
             session_name=session_name,
         )
+
+    def ssh_forward(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        validated = _validate_arguments(arguments)
+        connection = ConnectionSettings.from_arguments(validated)
+        direction = _string_argument(validated, "direction", required=True)
+        if direction not in {"local", "remote"}:
+            raise ValidationError("'direction' must be one of: local, remote.")
+        local_port = _int_argument(validated, "local_port", minimum=1, allow_zero=False)
+        if local_port is None:
+            raise ValidationError("'local_port' is required.")
+        if local_port > 65535:
+            raise ValidationError("'local_port' must be <= 65535.")
+        remote_host = _string_argument(validated, "remote_host", required=True)
+        remote_port = _int_argument(validated, "remote_port", minimum=1, allow_zero=False)
+        if remote_port is None:
+            raise ValidationError("'remote_port' is required.")
+        if remote_port > 65535:
+            raise ValidationError("'remote_port' must be <= 65535.")
+        bind_address = _string_argument(validated, "bind_address") or "127.0.0.1"
+        ssh_binary = _resolve_ssh_binary(self._configured_ssh_binary)
+        argv = connection.build_argv(ssh_binary, None, tty=False, keepalive=True)
+        # Insert -N (no command) and the forward spec before the target.
+        target_index = argv.index(connection.target)
+        forward_spec = f"{bind_address}:{local_port}:{remote_host}:{remote_port}"
+        flag = "-L" if direction == "local" else "-R"
+        argv[target_index:target_index] = ["-N", flag, forward_spec]
+        entry = self._forwards.start(
+            target=connection.target,
+            direction=direction,
+            local_port=local_port,
+            remote_host=remote_host,
+            remote_port=remote_port,
+            bind_address=bind_address,
+            argv=argv,
+        )
+        # Wait briefly to detect immediate SSH failures.
+        time.sleep(DEFAULT_FORWARD_STARTUP_WAIT)
+        result = entry.summary()
+        if not result["running"]:
+            try:
+                _, stderr_bytes = entry.process.communicate(timeout=0.1)
+                stderr = stderr_bytes.decode("utf-8", errors="replace").strip() if stderr_bytes else ""
+            except Exception:
+                stderr = ""
+            if stderr:
+                result["stderr"] = stderr
+        return result
+
+    def ssh_list_forwards(self, arguments: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        validated = _validate_arguments(arguments or {})
+        include_stopped = _bool_argument(validated, "include_stopped", default=False)
+        target = _string_argument(validated, "target")
+        return self._forwards.list_forwards(include_stopped=include_stopped, target=target)
+
+    def ssh_stop_forward(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        validated = _validate_arguments(arguments)
+        forward_id = _string_argument(validated, "forward_id", required=True)
+        return self._forwards.stop(forward_id)

@@ -717,3 +717,117 @@ class SshToolServiceTests(unittest.TestCase):
             self.assertEqual(session._unread_dropped_chars, 200)
             # The kept content must be the *tail* of the chunk.
             self.assertEqual(session._unread_output, "Y" * cap)
+
+    def test_extra_ssh_args_blocks_forwarding_short_flags(self) -> None:
+        for flag in ["-L", "-R", "-D", "-W"]:
+            with self.assertRaises(ValidationError, msg=f"{flag} should be blocked"):
+                self.service.ssh_exec(
+                    {"target": "example", "command": "true", "extra_ssh_args": [flag, "8080:localhost:80"]}
+                )
+
+    def test_extra_ssh_args_allows_safe_flags(self) -> None:
+        result = self.service.ssh_exec(
+            {"target": "example", "command": "true", "extra_ssh_args": ["-v", "-C"]}
+        )
+        self.assertTrue(result["ok"])
+
+    # ------------------------------------------------------------------
+    # Port forwarding tests
+    # ------------------------------------------------------------------
+
+    def test_forward_start_and_stop_lifecycle(self) -> None:
+        result = self.service.ssh_forward(
+            {
+                "target": "example",
+                "direction": "local",
+                "local_port": 15432,
+                "remote_host": "dbhost",
+                "remote_port": 5432,
+            }
+        )
+        self.assertTrue(result["running"])
+        self.assertEqual(result["direction"], "local")
+        self.assertEqual(result["local_port"], 15432)
+        self.assertEqual(result["remote_host"], "dbhost")
+        self.assertEqual(result["remote_port"], 5432)
+        self.assertEqual(result["bind_address"], "127.0.0.1")
+        forward_id = result["forward_id"]
+
+        listing = self.service.ssh_list_forwards({})
+        self.assertEqual(listing["count"], 1)
+        self.assertEqual(listing["forwards"][0]["forward_id"], forward_id)
+
+        stopped = self.service.ssh_stop_forward({"forward_id": forward_id})
+        self.assertTrue(stopped["was_running"])
+
+        listing_after = self.service.ssh_list_forwards({})
+        self.assertEqual(listing_after["count"], 0)
+
+        listing_with_stopped = self.service.ssh_list_forwards({"include_stopped": True})
+        self.assertEqual(listing_with_stopped["count"], 1)
+        self.assertFalse(listing_with_stopped["forwards"][0]["running"])
+
+    def test_forward_remote_direction(self) -> None:
+        result = self.service.ssh_forward(
+            {
+                "target": "example",
+                "direction": "remote",
+                "local_port": 8080,
+                "remote_host": "localhost",
+                "remote_port": 3000,
+            }
+        )
+        self.assertTrue(result["running"])
+        self.assertEqual(result["direction"], "remote")
+        self.assertIn("-R", result["ssh_command"])
+        self.service.ssh_stop_forward({"forward_id": result["forward_id"]})
+
+    def test_forward_invalid_direction_rejected(self) -> None:
+        with self.assertRaises(ValidationError):
+            self.service.ssh_forward(
+                {
+                    "target": "example",
+                    "direction": "dynamic",
+                    "local_port": 8080,
+                    "remote_host": "localhost",
+                    "remote_port": 80,
+                }
+            )
+
+    def test_forward_unknown_id_raises(self) -> None:
+        from ssh_mcp.ssh import ForwardNotFoundError
+        with self.assertRaises(ForwardNotFoundError):
+            self.service.ssh_stop_forward({"forward_id": "nonexistent"})
+
+    def test_forward_custom_bind_address(self) -> None:
+        result = self.service.ssh_forward(
+            {
+                "target": "example",
+                "direction": "local",
+                "local_port": 9999,
+                "remote_host": "dbhost",
+                "remote_port": 5432,
+                "bind_address": "0.0.0.0",
+            }
+        )
+        self.assertEqual(result["bind_address"], "0.0.0.0")
+        self.assertIn("0.0.0.0", result["ssh_command"])
+        self.service.ssh_stop_forward({"forward_id": result["forward_id"]})
+
+    def test_forward_cleanup_on_service_close(self) -> None:
+        result = self.service.ssh_forward(
+            {
+                "target": "example",
+                "direction": "local",
+                "local_port": 15000,
+                "remote_host": "localhost",
+                "remote_port": 80,
+            }
+        )
+        pid = result["pid"]
+        self.service.close()
+        try:
+            os.kill(pid, 0)
+            self.fail("Forward process should have been killed on close")
+        except ProcessLookupError:
+            pass

@@ -20,18 +20,23 @@ def create_fake_ssh(directory: Path) -> Path:
         import os
         import sys
 
-        VALUE_OPTIONS = {"-p", "-i", "-o", "-F"}
+        VALUE_OPTIONS = {"-p", "-i", "-o", "-F", "-L", "-R", "-D", "-W"}
 
         def parse_arguments(argv):
             index = 0
             target = None
             command_parts = []
+            no_command = False
             while index < len(argv):
                 arg = argv[index]
                 if target is None and arg in VALUE_OPTIONS:
                     index += 2
                     continue
                 if target is None and arg in {"-tt", "-T"}:
+                    index += 1
+                    continue
+                if target is None and arg == "-N":
+                    no_command = True
                     index += 1
                     continue
                 if target is None and arg.startswith("-"):
@@ -43,9 +48,9 @@ def create_fake_ssh(directory: Path) -> Path:
                 target = arg
                 command_parts = argv[index + 1 :]
                 break
-            return target, command_parts
+            return target, command_parts, no_command
 
-        target, command_parts = parse_arguments(sys.argv[1:])
+        target, command_parts, no_command = parse_arguments(sys.argv[1:])
         if target is None:
             print("fake ssh: missing target", file=sys.stderr)
             raise SystemExit(255)
@@ -63,6 +68,17 @@ def create_fake_ssh(directory: Path) -> Path:
                     )
                 )
                 handle.write("\\n")
+
+        # -N means "no command, just keep the connection open" (used for
+        # port forwarding).  Sleep until killed.
+        if no_command:
+            import signal as _sig
+            import time as _time
+            def _exit_handler(*_args):
+                raise SystemExit(0)
+            _sig.signal(_sig.SIGTERM, _exit_handler)
+            while True:
+                _time.sleep(60)
 
         environment = dict(os.environ)
         environment.setdefault("PS1", "")

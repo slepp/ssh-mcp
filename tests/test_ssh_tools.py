@@ -18,6 +18,7 @@ if str(SRC_DIR) not in sys.path:
 
 from ssh_mcp.ssh import SshToolService, ValidationError
 from ssh_mcp.ssh import DEFAULT_UNREAD_BUFFER_CAP
+from ssh_mcp.ssh import _sanitize_tmux_session_name
 from tests.helpers import create_fake_rsync, create_fake_scp, create_fake_ssh, create_fake_tmux
 
 
@@ -831,3 +832,210 @@ class SshToolServiceTests(unittest.TestCase):
             self.fail("Forward process should have been killed on close")
         except ProcessLookupError:
             pass
+
+    # ------------------------------------------------------------------
+    # Tmux session naming tests
+    # ------------------------------------------------------------------
+
+    def test_tmux_session_name_includes_target_and_session_name(self) -> None:
+        name = _sanitize_tmux_session_name("abc123", target="prod-web01", session_name="deploy-api")
+        self.assertEqual(name, "ssh-mcp-prod-web01-deploy-api")
+
+    def test_tmux_session_name_with_target_only(self) -> None:
+        name = _sanitize_tmux_session_name("abc123def4", target="prod-web01")
+        self.assertEqual(name, "ssh-mcp-prod-web01-abc123de")
+
+    def test_tmux_session_name_with_session_name_only(self) -> None:
+        name = _sanitize_tmux_session_name("abc123", session_name="deploy-api")
+        self.assertEqual(name, "ssh-mcp-deploy-api")
+
+    def test_tmux_session_name_fallback_to_session_id(self) -> None:
+        name = _sanitize_tmux_session_name("abc123def456")
+        self.assertEqual(name, "ssh-mcp-abc123de")
+
+    def test_tmux_session_name_sanitises_special_characters(self) -> None:
+        name = _sanitize_tmux_session_name("x", target="user@host:22", session_name="my session!")
+        self.assertNotIn("@", name)
+        self.assertNotIn(":", name)
+        self.assertNotIn("!", name)
+        self.assertNotIn(" ", name)
+
+    # ------------------------------------------------------------------
+    # Exit reason tests
+    # ------------------------------------------------------------------
+
+    def test_exit_reason_clean_exit(self) -> None:
+        started = self.service.ssh_start_session(
+            {"target": "example", "observer_mode": "transcript", "wait_seconds": 0.1}
+        )
+        exited = self._exit_session(started["session_id"], 0)
+        self.assertEqual(exited["exit_reason"], "clean-exit")
+
+    def test_exit_reason_nonzero_exit(self) -> None:
+        started = self.service.ssh_start_session(
+            {"target": "example", "observer_mode": "transcript", "wait_seconds": 0.1}
+        )
+        exited = self._exit_session(started["session_id"], 42)
+        self.assertEqual(exited["exit_reason"], "exit-42")
+
+    def test_exit_reason_is_none_while_running(self) -> None:
+        started = self.service.ssh_start_session(
+            {"target": "example", "observer_mode": "transcript", "wait_seconds": 0.1}
+        )
+        self.assertIsNone(started["exit_reason"])
+        self.service.ssh_stop_session({"session_id": started["session_id"]})
+
+    # ------------------------------------------------------------------
+    # Keepalive args tests
+    # ------------------------------------------------------------------
+
+    def test_session_argv_includes_keepalive(self) -> None:
+        started = self.service.ssh_start_session(
+            {"target": "example", "observer_mode": "transcript", "wait_seconds": 0.1}
+        )
+        argv = started["ssh_argv"]
+        cmd = started["ssh_command"]
+        self.assertIn("ServerAliveInterval=30", cmd)
+        self.assertIn("ServerAliveCountMax=3", cmd)
+        self.service.ssh_stop_session({"session_id": started["session_id"]})
+
+    def test_exec_argv_does_not_include_keepalive(self) -> None:
+        result = self.service.ssh_exec({"target": "example", "command": "true"})
+        self.assertNotIn("ServerAliveInterval", result["ssh_command"])
+
+    def test_session_keepalive_respects_user_override(self) -> None:
+        started = self.service.ssh_start_session(
+            {
+                "target": "example",
+                "observer_mode": "transcript",
+                "wait_seconds": 0.1,
+                "extra_ssh_args": ["-o", "ServerAliveInterval=60"],
+            }
+        )
+        cmd = started["ssh_command"]
+        self.assertIn("ServerAliveInterval=60", cmd)
+        # Should NOT also have the default 30
+        self.assertNotIn("ServerAliveInterval=30", cmd)
+        # ServerAliveCountMax should still be added since user didn't override it
+        self.assertIn("ServerAliveCountMax=3", cmd)
+        self.service.ssh_stop_session({"session_id": started["session_id"]})
+
+    # ------------------------------------------------------------------
+    # Auto-close tests
+    # ------------------------------------------------------------------
+
+    def test_auto_close_appears_in_snapshot(self) -> None:
+        started = self.service.ssh_start_session(
+            {
+                "target": "example",
+                "observer_mode": "transcript",
+                "wait_seconds": 0.1,
+                "auto_close": True,
+            }
+        )
+        self.assertTrue(started.get("auto_close"))
+        self.service.ssh_stop_session({"session_id": started["session_id"]})
+
+    def test_auto_close_false_omitted_from_snapshot(self) -> None:
+        started = self.service.ssh_start_session(
+            {"target": "example", "observer_mode": "transcript", "wait_seconds": 0.1}
+        )
+        self.assertNotIn("auto_close", started)
+        self.service.ssh_stop_session({"session_id": started["session_id"]})
+
+    # ------------------------------------------------------------------
+    # Session pruning tests
+    # ------------------------------------------------------------------
+
+    def test_prune_removes_old_exited_sessions(self) -> None:
+        started = self.service.ssh_start_session(
+            {"target": "example", "observer_mode": "transcript", "wait_seconds": 0.1}
+        )
+        session_id = started["session_id"]
+        self._exit_session(session_id, 0)
+
+        # Session is exited but recent — should still be listed.
+        listing = self.service.ssh_list_sessions({"include_exited": True})
+        ids = [s["session_id"] for s in listing["sessions"]]
+        self.assertIn(session_id, ids)
+
+        # Backdate the ended_at and force a prune cycle.
+        from datetime import timedelta
+        from ssh_mcp.ssh import utcnow
+        session = self.service._sessions._sessions[session_id]
+        session._ended_at = utcnow() - timedelta(hours=2)
+        # Reset the throttle so prune runs immediately.
+        self.service._sessions._last_prune_mono = time.monotonic() - 120
+        listing = self.service.ssh_list_sessions({"include_exited": True})
+        ids = [s["session_id"] for s in listing["sessions"]]
+        self.assertNotIn(session_id, ids)
+
+    def test_prune_auto_close_sessions_faster(self) -> None:
+        started = self.service.ssh_start_session(
+            {
+                "target": "example",
+                "observer_mode": "transcript",
+                "wait_seconds": 0.1,
+                "auto_close": True,
+            }
+        )
+        session_id = started["session_id"]
+        self._exit_session(session_id, 0)
+
+        # Backdate by 10 minutes — past the 5-minute auto_close threshold
+        # but within the 1-hour default.
+        from datetime import timedelta
+        from ssh_mcp.ssh import utcnow
+        session = self.service._sessions._sessions[session_id]
+        session._ended_at = utcnow() - timedelta(minutes=10)
+        self.service._sessions._last_prune_mono = time.monotonic() - 120
+        listing = self.service.ssh_list_sessions({"include_exited": True})
+        ids = [s["session_id"] for s in listing["sessions"]]
+        self.assertNotIn(session_id, ids)
+
+    # ------------------------------------------------------------------
+    # Blocked SSH option tests (the -o form)
+    # ------------------------------------------------------------------
+
+    def test_extra_ssh_args_blocks_proxycommand(self) -> None:
+        with self.assertRaises(ValidationError):
+            self.service.ssh_exec(
+                {"target": "example", "command": "true", "extra_ssh_args": ["-o", "ProxyCommand=evil"]}
+            )
+
+    def test_extra_ssh_args_blocks_inline_proxycommand(self) -> None:
+        with self.assertRaises(ValidationError):
+            self.service.ssh_exec(
+                {"target": "example", "command": "true", "extra_ssh_args": ["-oProxyCommand=evil"]}
+            )
+
+    def test_extra_ssh_args_allows_safe_ssh_options(self) -> None:
+        result = self.service.ssh_exec(
+            {"target": "example", "command": "true", "extra_ssh_args": ["-o", "StrictHostKeyChecking=no"]}
+        )
+        self.assertTrue(result["ok"])
+
+    # ------------------------------------------------------------------
+    # Forward argv construction tests
+    # ------------------------------------------------------------------
+
+    def test_forward_argv_contains_correct_flags(self) -> None:
+        result = self.service.ssh_forward(
+            {
+                "target": "example",
+                "direction": "local",
+                "local_port": 15432,
+                "remote_host": "dbhost",
+                "remote_port": 5432,
+            }
+        )
+        argv = result["ssh_argv"]
+        self.assertIn("-N", argv)
+        self.assertIn("-L", argv)
+        forward_spec = "127.0.0.1:15432:dbhost:5432"
+        self.assertIn(forward_spec, argv)
+        # -N and -L should come before the target
+        n_idx = argv.index("-N")
+        target_idx = argv.index("example")
+        self.assertLess(n_idx, target_idx)
+        self.service.ssh_stop_forward({"forward_id": result["forward_id"]})

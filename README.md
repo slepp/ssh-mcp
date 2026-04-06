@@ -22,19 +22,19 @@ An MCP server that gives AI agents SSH access to remote machines through your lo
 ### With uv (recommended)
 
 ```bash
-uvx --from git+https://github.com/slepp/ssh-mcp ssh-mcp
+uvx --from slepp-ssh-mcp ssh-mcp
 ```
 
 Or install persistently:
 
 ```bash
-uv tool install git+https://github.com/slepp/ssh-mcp
+uv tool install slepp-ssh-mcp
 ```
 
 ### With pip
 
 ```bash
-pip install git+https://github.com/slepp/ssh-mcp
+pip install slepp-ssh-mcp
 ```
 
 ## Setup
@@ -42,7 +42,7 @@ pip install git+https://github.com/slepp/ssh-mcp
 ### Claude Code
 
 ```bash
-claude mcp add --transport stdio --scope user ssh-mcp -- uvx --from git+https://github.com/slepp/ssh-mcp ssh-mcp
+claude mcp add --transport stdio --scope user ssh-mcp -- uvx --from slepp-ssh-mcp ssh-mcp
 ```
 
 Or commit a `.mcp.json` to share with your team:
@@ -53,7 +53,7 @@ Or commit a `.mcp.json` to share with your team:
     "ssh-mcp": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/slepp/ssh-mcp", "ssh-mcp"]
+      "args": ["--from", "slepp-ssh-mcp", "ssh-mcp"]
     }
   }
 }
@@ -62,7 +62,7 @@ Or commit a `.mcp.json` to share with your team:
 ### Codex CLI
 
 ```bash
-codex mcp add ssh-mcp -- uvx --from git+https://github.com/slepp/ssh-mcp ssh-mcp
+codex mcp add ssh-mcp -- uvx --from slepp-ssh-mcp ssh-mcp
 ```
 
 ### GitHub Copilot
@@ -75,7 +75,7 @@ Add to `~/.copilot/mcp-config.json` (or `.vscode/mcp.json` per-project):
     "ssh-mcp": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/slepp/ssh-mcp", "ssh-mcp"]
+      "args": ["--from", "slepp-ssh-mcp", "ssh-mcp"]
     }
   }
 }

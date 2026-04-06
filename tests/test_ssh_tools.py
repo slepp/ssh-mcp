@@ -53,6 +53,37 @@ class SshToolServiceTests(unittest.TestCase):
             os.environ["FAKE_TMUX_LOG"] = self._old_fake_tmux_log
         self._tempdir.cleanup()
 
+    def _exit_session(
+        self,
+        session_id: str,
+        exit_code: int = 0,
+        *,
+        wait_seconds: float = 2.0,
+    ) -> dict:
+        """Send ``exit <code>`` and wait until the process is confirmed dead.
+
+        The initial write may return before the process has fully exited
+        under heavy load.  If that happens, follow up with a read that
+        waits for EOF / process exit.
+        """
+        result = self.service.ssh_write_session(
+            {
+                "session_id": session_id,
+                "input": f"exit {exit_code}\n",
+                "wait_seconds": wait_seconds,
+                "max_output_chars": 4096,
+            }
+        )
+        if result["running"]:
+            result = self.service.ssh_read_session(
+                {
+                    "session_id": session_id,
+                    "wait_seconds": wait_seconds,
+                    "max_output_chars": 4096,
+                }
+            )
+        return result
+
     def test_ssh_exec_runs_command_with_wrappers(self) -> None:
         workspace = self.root / "workspace"
         workspace.mkdir()
@@ -283,14 +314,7 @@ class SshToolServiceTests(unittest.TestCase):
         self.assertTrue(listing["sessions"][0]["running"])
         self.assertEqual(listing["sessions"][0]["transcript_path"], started["transcript_path"])
 
-        exited = self.service.ssh_write_session(
-            {
-                "session_id": session_id,
-                "input": "exit 4\n",
-                "wait_seconds": 0.5,
-                "max_output_chars": 4096,
-            }
-        )
+        exited = self._exit_session(session_id, 4)
         self.assertFalse(exited["running"])
         self.assertEqual(exited["exit_code"], 4)
 
@@ -586,9 +610,7 @@ class SshToolServiceTests(unittest.TestCase):
     def test_tmux_observer_is_closed_when_session_exits_naturally(self) -> None:
         started = self.service.ssh_start_session({"target": "example", "observer_mode": "tmux"})
         session_id = started["session_id"]
-        exited = self.service.ssh_write_session(
-            {"session_id": session_id, "input": "exit 0\n", "wait_seconds": 0.5, "max_output_chars": 4096}
-        )
+        exited = self._exit_session(session_id, 0)
         self.assertFalse(exited["running"])
         for _ in range(20):
             log_entries = [
@@ -660,24 +682,25 @@ class SshToolServiceTests(unittest.TestCase):
             }
         )
         session_id = started["session_id"]
+        session = self.service._sessions.get(session_id)
         transcript_path = Path(started["transcript_path"])
 
-        # Write a payload that exceeds the in-memory cap.
+        # Inject a payload that exceeds the in-memory cap directly into
+        # the session's reader path.  Going through the PTY with a 1 MiB+
+        # command string is unreliable (shell arg limits, PTY buffer
+        # capacity), so we write directly to the internal append path
+        # which is what the reader thread uses.
         cap = DEFAULT_UNREAD_BUFFER_CAP
         large_payload = "Z" * (cap + 1024)
-        # Use printf to emit the data (fake-ssh executes it locally).
-        self.service.ssh_write_session(
-            {
-                "session_id": session_id,
-                "input": f"printf '%s' '{large_payload}'\n",
-                "wait_seconds": 1.0,
-                "max_output_chars": 4096,
-            }
-        )
+        session._append_transcript(large_payload)
+        with session._condition:
+            session._append_unread_locked(large_payload)
+
         self.service.ssh_stop_session({"session_id": session_id, "wait_seconds": 1.0})
 
         transcript_text = transcript_path.read_text(encoding="utf-8")
-        self.assertIn("Z" * 1024, transcript_text)
+        z_count = transcript_text.count("Z")
+        self.assertGreaterEqual(z_count, cap + 1024)
 
     def test_large_single_chunk_exceeding_cap_is_clamped(self) -> None:
         """A single chunk larger than the cap itself must be clamped to exactly

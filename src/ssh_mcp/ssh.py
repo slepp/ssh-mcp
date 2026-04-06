@@ -968,13 +968,13 @@ class SshSession:
                 session_id, target=target, session_name=session_name,
             ),
         )
+        self._observer_mode_requested = observer_mode
         self._reader = threading.Thread(
             target=self._reader_loop,
             name=f"ssh-session-{session_id}",
             daemon=True,
         )
         self._reader.start()
-        self.ensure_observer_mode(observer_mode)
 
     def _update_process_status_locked(self) -> None:
         return_code = self.process.poll()
@@ -1098,6 +1098,10 @@ class SshSession:
                     f"Failed to close the tmux observer: {exc}. The transcript is still available at "
                     f"{self._transcript_path}."
                 )
+                self._observer.mode = "transcript"
+                self._observer.tmux_started = False
+                self._observer.tmux_binary = None
+                self._observer.tmux_session_name = None
                 self._observer_stopping = False
             return
         except subprocess.TimeoutExpired:
@@ -1496,6 +1500,7 @@ class SessionManager:
                     pass
                 raise
             self._sessions[session_id] = session
+        session.ensure_observer_mode(session._observer_mode_requested)
         return session
 
     def ensure(

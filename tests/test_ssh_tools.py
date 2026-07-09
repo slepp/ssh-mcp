@@ -18,6 +18,7 @@ if str(SRC_DIR) not in sys.path:
 
 from ssh_mcp.ssh import SshToolService, ValidationError
 from ssh_mcp.ssh import DEFAULT_UNREAD_BUFFER_CAP
+from ssh_mcp.ssh import RemoteFileError
 from ssh_mcp.ssh import _sanitize_tmux_session_name
 from tests.helpers import create_fake_rsync, create_fake_scp, create_fake_ssh, create_fake_tmux
 
@@ -262,6 +263,528 @@ class SshToolServiceTests(unittest.TestCase):
 
         self.assertTrue(synced["ok"])
         self.assertEqual((destination_root / "new.txt").read_text(encoding="utf-8"), "new")
+
+    # -- ssh_view ---------------------------------------------------------
+
+    def test_ssh_view_reads_small_file(self) -> None:
+        target_file = self.root / "view-me.txt"
+        target_file.write_text("line1\nline2\nline3\n", encoding="utf-8")
+
+        result = self.service.ssh_view({"target": "example", "path": str(target_file)})
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["is_directory"])
+        self.assertEqual(result["content"], "line1\nline2\nline3\n")
+        self.assertEqual(result["total_lines"], 3)
+        self.assertEqual(result["size_bytes"], len("line1\nline2\nline3\n"))
+        self.assertFalse(result["truncated"])
+
+    def test_ssh_view_preserves_crlf_line_endings(self) -> None:
+        # Regression test: subprocess text-mode communicate() silently
+        # normalizes '\r\n'/'\r' to '\n' unless bytes are decoded manually.
+        target_file = self.root / "crlf.txt"
+        target_file.write_bytes(b"alpha\r\nbeta\r\ngamma\r\n")
+
+        result = self.service.ssh_view({"target": "example", "path": str(target_file)})
+
+        self.assertEqual(result["content"], "alpha\r\nbeta\r\ngamma\r\n")
+        self.assertEqual(result["size_bytes"], len(b"alpha\r\nbeta\r\ngamma\r\n"))
+
+    def test_ssh_view_supports_view_range(self) -> None:
+        target_file = self.root / "range.txt"
+        target_file.write_text("\n".join(str(n) for n in range(1, 11)) + "\n", encoding="utf-8")
+
+        result = self.service.ssh_view(
+            {"target": "example", "path": str(target_file), "view_range": [3, 5]}
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["content"], "3\n4\n5\n")
+        self.assertEqual(result["start_line"], 3)
+        self.assertEqual(result["end_line"], 5)
+        self.assertEqual(result["total_lines"], 10)
+
+    def test_ssh_view_range_to_end_of_file(self) -> None:
+        target_file = self.root / "range-end.txt"
+        target_file.write_text("\n".join(str(n) for n in range(1, 6)) + "\n", encoding="utf-8")
+
+        result = self.service.ssh_view(
+            {"target": "example", "path": str(target_file), "view_range": [3, -1]}
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["content"], "3\n4\n5\n")
+
+    def test_ssh_view_truncates_large_files_by_default(self) -> None:
+        target_file = self.root / "big.txt"
+        target_file.write_text("abcdefghij", encoding="utf-8")
+
+        result = self.service.ssh_view(
+            {"target": "example", "path": str(target_file), "max_bytes": 5}
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["content"], "abcde")
+        self.assertEqual(result["size_bytes"], 10)
+
+    def test_ssh_view_force_read_large_files_bypasses_truncation(self) -> None:
+        target_file = self.root / "big-force.txt"
+        target_file.write_text("abcdefghij", encoding="utf-8")
+
+        result = self.service.ssh_view(
+            {
+                "target": "example",
+                "path": str(target_file),
+                "max_bytes": 5,
+                "force_read_large_files": True,
+            }
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["content"], "abcdefghij")
+
+    def test_ssh_view_lists_directory_excluding_hidden_entries(self) -> None:
+        directory = self.root / "listing"
+        directory.mkdir()
+        (directory / "a.txt").write_text("a", encoding="utf-8")
+        (directory / "sub").mkdir()
+        (directory / "sub" / "b.txt").write_text("b", encoding="utf-8")
+        (directory / ".hidden").write_text("secret", encoding="utf-8")
+
+        result = self.service.ssh_view({"target": "example", "path": str(directory)})
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["is_directory"])
+        entry_paths = {entry["path"] for entry in result["entries"]}
+        self.assertIn(str(directory / "a.txt"), entry_paths)
+        self.assertIn(str(directory / "sub"), entry_paths)
+        self.assertIn(str(directory / "sub" / "b.txt"), entry_paths)
+        self.assertNotIn(str(directory / ".hidden"), entry_paths)
+        kinds = {entry["path"]: entry["type"] for entry in result["entries"]}
+        self.assertEqual(kinds[str(directory / "sub")], "directory")
+        self.assertEqual(kinds[str(directory / "a.txt")], "file")
+
+    def test_ssh_view_missing_path_raises_remote_file_error(self) -> None:
+        with self.assertRaises(RemoteFileError):
+            self.service.ssh_view({"target": "example", "path": str(self.root / "nope.txt")})
+
+    def test_ssh_view_handles_relative_path_starting_with_dash(self) -> None:
+        # Regression test: BSD/macOS sed and test(1) can misparse a bare
+        # leading '-' as an option rather than a filename; ssh_view must
+        # shield relative dash-leading paths (see _shield_leading_dash).
+        directory = self.root / "dash-view"
+        directory.mkdir()
+        (directory / "-dashfile.txt").write_text("hello from dashfile\n", encoding="utf-8")
+        previous_cwd = os.getcwd()
+        os.chdir(directory)
+        try:
+            result = self.service.ssh_view({"target": "example", "path": "-dashfile.txt"})
+        finally:
+            os.chdir(previous_cwd)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["content"], "hello from dashfile\n")
+
+    # -- ssh_create ---------------------------------------------------------
+
+    def test_ssh_create_writes_new_file(self) -> None:
+        target_file = self.root / "created.txt"
+
+        result = self.service.ssh_create(
+            {"target": "example", "path": str(target_file), "content": "hello\nworld\n"}
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(target_file.read_text(encoding="utf-8"), "hello\nworld\n")
+        self.assertEqual(result["bytes_written"], len("hello\nworld\n"))
+
+    def test_ssh_create_preserves_crlf_line_endings(self) -> None:
+        target_file = self.root / "created-crlf.txt"
+
+        result = self.service.ssh_create(
+            {"target": "example", "path": str(target_file), "content": "hello\r\nworld\r\n"}
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(target_file.read_bytes(), b"hello\r\nworld\r\n")
+
+    def test_ssh_create_allows_empty_content(self) -> None:
+        target_file = self.root / "empty.txt"
+
+        result = self.service.ssh_create({"target": "example", "path": str(target_file), "content": ""})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(target_file.read_text(encoding="utf-8"), "")
+
+    def test_ssh_create_refuses_existing_file(self) -> None:
+        target_file = self.root / "already-there.txt"
+        target_file.write_text("existing", encoding="utf-8")
+
+        with self.assertRaises(RemoteFileError):
+            self.service.ssh_create({"target": "example", "path": str(target_file), "content": "new"})
+        self.assertEqual(target_file.read_text(encoding="utf-8"), "existing")
+
+    def test_ssh_create_refuses_missing_parent_directory(self) -> None:
+        target_file = self.root / "no-such-dir" / "file.txt"
+
+        with self.assertRaises(RemoteFileError):
+            self.service.ssh_create({"target": "example", "path": str(target_file), "content": "new"})
+        self.assertFalse(target_file.exists())
+
+    # -- ssh_edit -----------------------------------------------------------
+
+    def test_ssh_edit_replaces_unique_match(self) -> None:
+        target_file = self.root / "edit-me.txt"
+        target_file.write_text("def foo():\n    return 1\n", encoding="utf-8")
+
+        result = self.service.ssh_edit(
+            {
+                "target": "example",
+                "path": str(target_file),
+                "edits": [{"old_str": "return 1", "new_str": "return 2"}],
+            }
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["edits_applied"], 1)
+        self.assertEqual(target_file.read_text(encoding="utf-8"), "def foo():\n    return 2\n")
+
+    def test_ssh_edit_preserves_crlf_line_endings_unrelated_to_the_edit(self) -> None:
+        # Regression test: ssh_edit reads the file, edits it, and writes the
+        # result straight back -- any CRLF/CR normalization on the read side
+        # would silently corrupt line endings even for an unrelated edit.
+        target_file = self.root / "edit-crlf.txt"
+        target_file.write_bytes(b"alpha\r\nbeta\r\ngamma\r\n")
+
+        result = self.service.ssh_edit(
+            {
+                "target": "example",
+                "path": str(target_file),
+                "edits": [{"old_str": "beta", "new_str": "BETA"}],
+            }
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(target_file.read_bytes(), b"alpha\r\nBETA\r\ngamma\r\n")
+
+    def test_ssh_edit_applies_batched_edits_sequentially(self) -> None:
+        target_file = self.root / "batch-edit.txt"
+        target_file.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+        result = self.service.ssh_edit(
+            {
+                "target": "example",
+                "path": str(target_file),
+                "edits": [
+                    {"old_str": "alpha", "new_str": "ALPHA"},
+                    {"old_str": "beta", "new_str": "BETA"},
+                    {"old_str": "ALPHA\nBETA", "new_str": "ALPHA-BETA"},
+                ],
+            }
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["edits_applied"], 3)
+        self.assertEqual(target_file.read_text(encoding="utf-8"), "ALPHA-BETA\ngamma\n")
+
+    def test_ssh_edit_fails_when_old_str_not_found(self) -> None:
+        target_file = self.root / "not-found.txt"
+        target_file.write_text("original content\n", encoding="utf-8")
+
+        with self.assertRaises(RemoteFileError):
+            self.service.ssh_edit(
+                {
+                    "target": "example",
+                    "path": str(target_file),
+                    "edits": [{"old_str": "missing text", "new_str": "replacement"}],
+                }
+            )
+        self.assertEqual(target_file.read_text(encoding="utf-8"), "original content\n")
+
+    def test_ssh_edit_fails_when_old_str_not_unique(self) -> None:
+        target_file = self.root / "not-unique.txt"
+        target_file.write_text("dup\ndup\n", encoding="utf-8")
+
+        with self.assertRaises(RemoteFileError):
+            self.service.ssh_edit(
+                {
+                    "target": "example",
+                    "path": str(target_file),
+                    "edits": [{"old_str": "dup", "new_str": "unique"}],
+                }
+            )
+        self.assertEqual(target_file.read_text(encoding="utf-8"), "dup\ndup\n")
+
+    def test_ssh_edit_missing_file_raises_remote_file_error(self) -> None:
+        with self.assertRaises(RemoteFileError):
+            self.service.ssh_edit(
+                {
+                    "target": "example",
+                    "path": str(self.root / "nope.txt"),
+                    "edits": [{"old_str": "a", "new_str": "b"}],
+                }
+            )
+
+    def test_ssh_edit_on_directory_raises_remote_file_error(self) -> None:
+        directory = self.root / "a-directory"
+        directory.mkdir()
+
+        with self.assertRaises(RemoteFileError):
+            self.service.ssh_edit(
+                {
+                    "target": "example",
+                    "path": str(directory),
+                    "edits": [{"old_str": "a", "new_str": "b"}],
+                }
+            )
+
+    # -- ssh_grep -------------------------------------------------------------
+
+    def test_ssh_grep_content_mode_returns_matching_lines(self) -> None:
+        directory = self.root / "grep-content"
+        directory.mkdir()
+        (directory / "a.py").write_text("foo\nbar\nfoo again\n", encoding="utf-8")
+
+        result = self.service.ssh_grep(
+            {"target": "example", "pattern": "foo", "path": str(directory), "output_mode": "content"}
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["output_mode"], "content")
+        lines = {(m["line_number"], m["line"]) for m in result["matches"]}
+        self.assertIn((1, "foo"), lines)
+        self.assertIn((3, "foo again"), lines)
+        self.assertTrue(all(m["path"].endswith("a.py") for m in result["matches"]))
+
+    def test_ssh_grep_defaults_to_files_with_matches(self) -> None:
+        directory = self.root / "grep-default"
+        directory.mkdir()
+        (directory / "hit.txt").write_text("needle\n", encoding="utf-8")
+        (directory / "miss.txt").write_text("nothing here\n", encoding="utf-8")
+
+        result = self.service.ssh_grep({"target": "example", "pattern": "needle", "path": str(directory)})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["output_mode"], "files_with_matches")
+        self.assertEqual(result["matches"], [str(directory / "hit.txt")])
+
+    def test_ssh_grep_count_mode_omits_zero_match_files(self) -> None:
+        directory = self.root / "grep-count"
+        directory.mkdir()
+        (directory / "hit.txt").write_text("needle\nneedle again\n", encoding="utf-8")
+        (directory / "miss.txt").write_text("nothing\n", encoding="utf-8")
+
+        result = self.service.ssh_grep(
+            {"target": "example", "pattern": "needle", "path": str(directory), "output_mode": "count"}
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["matches"], [{"path": str(directory / "hit.txt"), "count": 2}])
+
+    def test_ssh_grep_case_insensitive(self) -> None:
+        directory = self.root / "grep-case"
+        directory.mkdir()
+        (directory / "a.txt").write_text("Needle\n", encoding="utf-8")
+
+        result = self.service.ssh_grep(
+            {
+                "target": "example",
+                "pattern": "needle",
+                "path": str(directory),
+                "output_mode": "files_with_matches",
+                "case_insensitive": True,
+            }
+        )
+
+        self.assertEqual(result["matches"], [str(directory / "a.txt")])
+
+    def test_ssh_grep_glob_filter(self) -> None:
+        directory = self.root / "grep-glob"
+        directory.mkdir()
+        (directory / "a.py").write_text("needle\n", encoding="utf-8")
+        (directory / "b.txt").write_text("needle\n", encoding="utf-8")
+
+        result = self.service.ssh_grep(
+            {"target": "example", "pattern": "needle", "path": str(directory), "glob": "*.py"}
+        )
+
+        self.assertEqual(result["matches"], [str(directory / "a.py")])
+
+    def test_ssh_grep_excludes_git_directory(self) -> None:
+        directory = self.root / "grep-git-exclude"
+        (directory / ".git").mkdir(parents=True)
+        (directory / ".git" / "config").write_text("needle\n", encoding="utf-8")
+        (directory / "visible.txt").write_text("needle\n", encoding="utf-8")
+
+        result = self.service.ssh_grep({"target": "example", "pattern": "needle", "path": str(directory)})
+
+        self.assertEqual(result["matches"], [str(directory / "visible.txt")])
+
+    def test_ssh_grep_context_lines(self) -> None:
+        directory = self.root / "grep-context"
+        directory.mkdir()
+        (directory / "ctx.txt").write_text("one\ntwo\nMATCH\nfour\nfive\n", encoding="utf-8")
+
+        result = self.service.ssh_grep(
+            {
+                "target": "example",
+                "pattern": "MATCH",
+                "path": str(directory),
+                "output_mode": "content",
+                "context": 1,
+            }
+        )
+
+        self.assertTrue(result["ok"])
+        by_line = {m["line_number"]: m for m in result["matches"]}
+        self.assertEqual(by_line[3]["line"], "MATCH")
+        self.assertNotIn("is_context", by_line[3])
+        self.assertEqual(by_line[2]["line"], "two")
+        self.assertTrue(by_line[2]["is_context"])
+        self.assertEqual(by_line[4]["line"], "four")
+        self.assertTrue(by_line[4]["is_context"])
+
+    def test_ssh_grep_context_requires_content_mode(self) -> None:
+        with self.assertRaises(ValidationError):
+            self.service.ssh_grep(
+                {
+                    "target": "example",
+                    "pattern": "x",
+                    "path": str(self.root),
+                    "output_mode": "files_with_matches",
+                    "context": 1,
+                }
+            )
+
+    def test_ssh_grep_no_matches_is_not_an_error(self) -> None:
+        directory = self.root / "grep-empty"
+        directory.mkdir()
+        (directory / "a.txt").write_text("nothing relevant\n", encoding="utf-8")
+
+        result = self.service.ssh_grep({"target": "example", "pattern": "zzz_no_match", "path": str(directory)})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["matches"], [])
+
+    def test_ssh_grep_missing_path_raises_remote_file_error(self) -> None:
+        with self.assertRaises(RemoteFileError) as ctx:
+            self.service.ssh_grep({"target": "example", "pattern": "x", "path": str(self.root / "nope")})
+        self.assertIn("does not exist", str(ctx.exception))
+
+    def test_ssh_grep_pattern_starting_with_dash_is_treated_literally(self) -> None:
+        directory = self.root / "grep-dash-pattern"
+        directory.mkdir()
+        (directory / "a.txt").write_text("-verbose flag\n", encoding="utf-8")
+
+        result = self.service.ssh_grep(
+            {"target": "example", "pattern": "-verbose", "path": str(directory), "output_mode": "content"}
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["matches"]), 1)
+        self.assertEqual(result["matches"][0]["line"], "-verbose flag")
+
+    def test_ssh_grep_head_limit_truncates_matches(self) -> None:
+        directory = self.root / "grep-head-limit"
+        directory.mkdir()
+        (directory / "a.txt").write_text("needle\nneedle\nneedle\n", encoding="utf-8")
+
+        result = self.service.ssh_grep(
+            {
+                "target": "example",
+                "pattern": "needle",
+                "path": str(directory),
+                "output_mode": "content",
+                "head_limit": 2,
+            }
+        )
+
+        self.assertEqual(len(result["matches"]), 2)
+        self.assertTrue(result["truncated"])
+
+    # -- ssh_glob -------------------------------------------------------------
+
+    def test_ssh_glob_matches_recursive_pattern(self) -> None:
+        directory = self.root / "glob-recursive"
+        (directory / "src" / "a").mkdir(parents=True)
+        (directory / "src" / "top.ts").write_text("", encoding="utf-8")
+        (directory / "src" / "a" / "nested.ts").write_text("", encoding="utf-8")
+        (directory / "src" / "a" / "nested.js").write_text("", encoding="utf-8")
+
+        result = self.service.ssh_glob(
+            {"target": "example", "pattern": "src/**/*.ts", "path": str(directory)}
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            set(result["matches"]),
+            {"src/top.ts", "src/a/nested.ts"},
+        )
+
+    def test_ssh_glob_brace_alternation(self) -> None:
+        directory = self.root / "glob-brace"
+        directory.mkdir()
+        (directory / "a.ts").write_text("", encoding="utf-8")
+        (directory / "a.tsx").write_text("", encoding="utf-8")
+        (directory / "a.js").write_text("", encoding="utf-8")
+
+        result = self.service.ssh_glob(
+            {"target": "example", "pattern": "*.{ts,tsx}", "path": str(directory)}
+        )
+
+        self.assertEqual(set(result["matches"]), {"a.ts", "a.tsx"})
+
+    def test_ssh_glob_excludes_hidden_entries_by_default(self) -> None:
+        directory = self.root / "glob-hidden"
+        (directory / ".config").mkdir(parents=True)
+        (directory / ".config" / "settings.txt").write_text("", encoding="utf-8")
+        (directory / "visible.txt").write_text("", encoding="utf-8")
+
+        result = self.service.ssh_glob({"target": "example", "pattern": "**/*", "path": str(directory)})
+
+        self.assertEqual(result["matches"], ["visible.txt"])
+
+    def test_ssh_glob_prunes_git_directory_remotely(self) -> None:
+        # Regression test: verifies the remote find(1) script actually prunes
+        # .git (distinct from the Python-side hidden-segment guard exercised
+        # by test_ssh_glob_excludes_hidden_entries_by_default above). Using a
+        # pattern whose first segment is itself literally dot-prefixed
+        # bypasses that guard, so this only passes if .git was pruned
+        # remotely before ever reaching the Python-side matcher.
+        directory = self.root / "glob-git-prune"
+        (directory / ".git").mkdir(parents=True)
+        (directory / ".git" / "config").write_text("", encoding="utf-8")
+        (directory / "visible.txt").write_text("", encoding="utf-8")
+
+        result = self.service.ssh_glob({"target": "example", "pattern": ".git/**", "path": str(directory)})
+
+        self.assertEqual(result["matches"], [])
+
+    def test_ssh_glob_head_limit_truncates_matches(self) -> None:
+        directory = self.root / "glob-head-limit"
+        directory.mkdir()
+        for name in ("a.txt", "b.txt", "c.txt"):
+            (directory / name).write_text("", encoding="utf-8")
+
+        result = self.service.ssh_glob(
+            {"target": "example", "pattern": "*.txt", "path": str(directory), "head_limit": 2}
+        )
+
+        self.assertEqual(len(result["matches"]), 2)
+        self.assertTrue(result["truncated"])
+
+    def test_ssh_glob_missing_directory_raises_remote_file_error(self) -> None:
+        with self.assertRaises(RemoteFileError):
+            self.service.ssh_glob({"target": "example", "pattern": "*.txt", "path": str(self.root / "nope")})
+
+    def test_ssh_glob_path_that_is_a_file_raises_remote_file_error(self) -> None:
+        target_file = self.root / "not-a-dir.txt"
+        target_file.write_text("x", encoding="utf-8")
+
+        with self.assertRaises(RemoteFileError):
+            self.service.ssh_glob({"target": "example", "pattern": "*.txt", "path": str(target_file)})
 
     def test_interactive_session_lifecycle(self) -> None:
         workspace = self.root / "session-workspace"

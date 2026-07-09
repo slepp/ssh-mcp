@@ -1,10 +1,11 @@
 # ssh-mcp
 
-An MCP server that gives AI agents SSH access to remote machines through your local OpenSSH client. It wraps `ssh`, `scp`, and `rsync` so agents can run remote commands, transfer files, maintain persistent shell sessions, and set up port forwards — all using your existing SSH config, keys, and credentials.
+An MCP server that gives AI agents SSH access to remote machines through your local OpenSSH client. It wraps `ssh`, `scp`, and `rsync` so agents can run remote commands, transfer files, maintain persistent shell sessions, set up port forwards, and read/edit/search remote files directly — all using your existing SSH config, keys, and credentials.
 
 ## Why ssh-mcp?
 
 - **Uses your local SSH** — host aliases, `~/.ssh/config`, `ProxyJump`, agent forwarding, and existing credentials all work naturally. No SSH libraries or key management.
+- **Native-feeling remote editing** — `ssh_view`/`ssh_create`/`ssh_edit`/`ssh_grep`/`ssh_glob` mirror the read/edit/search tools agents already use locally, so remote files can be read, searched, and edited exactly like local ones instead of through ad hoc `cat`/`sed`/`grep` commands.
 - **Persistent sessions** — agents can keep a shell open across multiple tool calls, just like a human would. Sessions survive context window resets when you give them a `session_name`.
 - **Observable** — every session records a transcript and optionally launches a detached tmux viewer so you can watch what the agent is doing in real time.
 - **Permission-gatable** — port forwarding is a separate tool from command execution, so MCP clients can allow SSH access without allowing port forwards.
@@ -15,6 +16,7 @@ An MCP server that gives AI agents SSH access to remote machines through your lo
 - Python 3.10+
 - `ssh` and `scp` on PATH (or set `SSH_MCP_SSH_BIN` / `SSH_MCP_SCP_BIN`)
 - `rsync` on PATH (or set `SSH_MCP_RSYNC_BIN`) — only needed for `ssh_sync`
+- `grep` and `find` on the **remote** host — needed for `ssh_grep` / `ssh_glob` (present on effectively all POSIX systems)
 - `tmux` — optional, for live session observation
 
 ## Installation
@@ -89,7 +91,7 @@ Any stdio MCP client works. Point it at `uvx --from slepp-ssh-mcp ssh-mcp` or at
 
 ssh-mcp runs as a stdio process that your MCP client spawns. It receives JSON-RPC tool calls and translates them into local `ssh`/`scp`/`rsync` commands. Because it uses your local SSH binary, everything in your `~/.ssh/config` works — jump hosts, custom ports, key selection, `SSH_AUTH_SOCK`, proxy commands.
 
-There are three modes of operation:
+There are five modes of operation:
 
 ### One-off commands (`ssh_exec`)
 
@@ -184,6 +186,75 @@ For `upload`, `sources` are local paths and `destination` is remote. For `downlo
 }
 ```
 
+### Remote file access (`ssh_view`, `ssh_create`, `ssh_edit`, `ssh_grep`, `ssh_glob`)
+
+These mirror the read/edit/search tools agents use locally, but operate on files on the remote host — so remote editing feels the same as local editing instead of composing `cat`/`sed`/`grep` by hand over `ssh_exec`.
+
+**`ssh_view`** — read a file or list a directory:
+
+```json
+{
+  "target": "prod-web01",
+  "path": "/etc/nginx/nginx.conf"
+}
+```
+
+Returns `content`, `size_bytes`, and `total_lines`. Content is truncated at 20KB by default — pass `view_range: [start, end]` (1-based, inclusive; `end: -1` means "to end of file") to page through large files, or `force_read_large_files: true` to read the whole thing anyway. If `path` is a directory, returns non-hidden entries up to 2 levels deep instead.
+
+**`ssh_create`** — write a brand-new remote file:
+
+```json
+{
+  "target": "prod-web01",
+  "path": "/etc/systemd/system/myapp.service",
+  "content": "[Unit]\nDescription=My app\n..."
+}
+```
+
+Fails if `path` already exists or its parent directory doesn't, exactly like the local file-creation tool.
+
+**`ssh_edit`** — exact string replacement in an existing file:
+
+```json
+{
+  "target": "prod-web01",
+  "path": "/etc/nginx/nginx.conf",
+  "edits": [
+    {"old_str": "worker_processes 1;", "new_str": "worker_processes auto;"}
+  ]
+}
+```
+
+Each `old_str` must match exactly one location in the file (as it stands after any earlier edits in the same call) — ambiguous or missing matches fail without writing anything. Pass multiple `{old_str, new_str}` entries in `edits` to batch several changes into one round trip instead of one SSH connection per edit.
+
+**`ssh_grep`** — search remote file contents:
+
+```json
+{
+  "target": "prod-web01",
+  "pattern": "ERROR|WARN",
+  "path": "/var/log/myapp",
+  "glob": "*.log",
+  "output_mode": "content"
+}
+```
+
+`output_mode` is `files_with_matches` (default), `content` (matching lines, with line numbers and optional `context`/`context_before`/`context_after`), or `count` (per-file match counts; files with zero matches are omitted). Backed by remote `grep`, preferring PCRE-like `-P` when available and falling back to POSIX extended regex otherwise. Always skips `.git`/`.hg`/`.svn`.
+
+**`ssh_glob`** — find remote files by name:
+
+```json
+{
+  "target": "prod-web01",
+  "pattern": "src/**/*.ts",
+  "path": "/srv/app"
+}
+```
+
+Supports `*`, `?`, `[seq]`/`[!seq]`, `{a,b}` alternation, and `**` (zero or more path segments). A path segment starting with `.` is only matched by a pattern segment that itself starts with `.`, matching classic Unix glob behavior.
+
+All five tools raise a `remote_file_error` (see [Tools reference](#tools-reference)) for problems like a missing path, a path that already exists, or an ambiguous/missing `edit` match — the on-the-wire outcome you'd expect from the equivalent local tool.
+
 ### Port forwarding (`ssh_forward`)
 
 Create local or remote port forwards. This is a separate tool from `ssh_exec` so MCP clients can grant SSH access without granting port forwarding.
@@ -268,6 +339,10 @@ ssh-mcp is designed for single-developer use on your own machine. It runs SSH co
 - **No multiplexing** — each `ssh_exec` call opens a new SSH connection. If your agent runs many rapid commands to the same host, consider using a session instead, or configure `ControlMaster` in your `~/.ssh/config`.
 - **Transcript growth** — transcripts grow without bound for long-running sessions. The response includes `transcript_size_bytes` so you can monitor this. Restart the session if it gets too large.
 - **Forward connections are standalone** — each `ssh_forward` opens its own SSH connection. Forwards are not tied to sessions.
+- **Remote file tools are text-oriented** — `ssh_view`/`ssh_create`/`ssh_edit` decode remote content as UTF-8 with `errors="replace"`; binary files may come back with stray replacement characters. They're built for source/config files, like their local counterparts.
+- **`ssh_edit` isn't fully atomic** — it reads the file, applies edits locally, then writes the result back in a second SSH round trip. A concurrent external write between the two round trips could be overwritten, same class of risk as editing any file that's being modified elsewhere.
+- **`ssh_grep` regex flavor depends on the remote** — it prefers PCRE-like `-P` (closer to what agents expect) when the remote `grep`/`ggrep` supports it, otherwise falls back to POSIX extended regex (`-E`), which lacks things like `\d`/`\w`/`\b`. `multiline` matching isn't supported.
+- **`ssh_glob`/`ssh_grep` list the whole subtree** — matching happens after enumerating files under `path` via remote `find`; scope `path` to something reasonable on very large trees.
 
 ## Tools reference
 
@@ -276,6 +351,11 @@ ssh-mcp is designed for single-developer use on your own machine. It runs SSH co
 | `ssh_exec` | Run a one-off remote command |
 | `ssh_scp` | Copy files via scp |
 | `ssh_sync` | Incremental sync via rsync |
+| `ssh_view` | Read a remote file (with paging) or list a remote directory |
+| `ssh_create` | Create a new remote file |
+| `ssh_edit` | Exact string replacement in an existing remote file |
+| `ssh_grep` | Search remote file contents |
+| `ssh_glob` | Find remote files by name pattern |
 | `ssh_start_session` | Start a new interactive session |
 | `ssh_ensure_session` | Reuse or start an interactive session (recommended) |
 | `ssh_read_session` | Read output from a session |
@@ -286,7 +366,7 @@ ssh-mcp is designed for single-developer use on your own machine. It runs SSH co
 | `ssh_list_forwards` | List tracked forwards |
 | `ssh_stop_forward` | Stop a port forward |
 
-All session and forward tools accept standard SSH connection parameters: `port`, `identity_file`, `known_hosts_file`, `strict_host_key_checking`, and `extra_ssh_args`.
+All session and forward tools accept standard SSH connection parameters: `port`, `identity_file`, `known_hosts_file`, `strict_host_key_checking`, and `extra_ssh_args`. So do `ssh_view`, `ssh_create`, `ssh_edit`, `ssh_grep`, and `ssh_glob`.
 
 ## Development
 

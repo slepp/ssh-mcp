@@ -85,6 +85,11 @@ class StdioServerTests(unittest.TestCase):
         self.assertIn("ssh_exec", names)
         self.assertIn("ssh_scp", names)
         self.assertIn("ssh_sync", names)
+        self.assertIn("ssh_view", names)
+        self.assertIn("ssh_create", names)
+        self.assertIn("ssh_edit", names)
+        self.assertIn("ssh_grep", names)
+        self.assertIn("ssh_glob", names)
         self.assertIn("ssh_start_session", names)
         self.assertIn("ssh_ensure_session", names)
 
@@ -348,3 +353,108 @@ class StdioServerTests(unittest.TestCase):
         )
         self.assertFalse(stopped["result"]["isError"])
         self.assertTrue(stopped["result"]["structuredContent"]["was_running"])
+
+    def test_stdio_file_tools_round_trip(self) -> None:
+        self._rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+
+        target_file = self.root / "stdio-file-tools.txt"
+        create_call = self._rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "ssh_create",
+                    "arguments": {
+                        "target": "example",
+                        "path": str(target_file),
+                        "content": "def greet():\n    return 'hi'\n",
+                    },
+                },
+            }
+        )
+        self.assertFalse(create_call["result"]["isError"])
+        self.assertEqual(target_file.read_text(encoding="utf-8"), "def greet():\n    return 'hi'\n")
+
+        view_call = self._rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "ssh_view", "arguments": {"target": "example", "path": str(target_file)}},
+            }
+        )
+        view_structured = view_call["result"]["structuredContent"]
+        self.assertTrue(view_structured["ok"])
+        self.assertEqual(view_structured["content"], "def greet():\n    return 'hi'\n")
+
+        edit_call = self._rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "ssh_edit",
+                    "arguments": {
+                        "target": "example",
+                        "path": str(target_file),
+                        "edits": [{"old_str": "'hi'", "new_str": "'hello'"}],
+                    },
+                },
+            }
+        )
+        self.assertFalse(edit_call["result"]["isError"])
+        self.assertEqual(target_file.read_text(encoding="utf-8"), "def greet():\n    return 'hello'\n")
+
+        grep_call = self._rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "ssh_grep",
+                    "arguments": {
+                        "target": "example",
+                        "pattern": "hello",
+                        "path": str(self.root),
+                        "output_mode": "files_with_matches",
+                    },
+                },
+            }
+        )
+        grep_structured = grep_call["result"]["structuredContent"]
+        self.assertTrue(grep_structured["ok"])
+        self.assertIn(str(target_file), grep_structured["matches"])
+
+        glob_call = self._rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "ssh_glob",
+                    "arguments": {
+                        "target": "example",
+                        "pattern": "**/*.txt",
+                        "path": str(self.root),
+                    },
+                },
+            }
+        )
+        glob_structured = glob_call["result"]["structuredContent"]
+        self.assertTrue(glob_structured["ok"])
+        self.assertIn(target_file.name, glob_structured["matches"])
+
+        missing_call = self._rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "ssh_view",
+                    "arguments": {"target": "example", "path": str(self.root / "does-not-exist.txt")},
+                },
+            }
+        )
+        self.assertTrue(missing_call["result"]["isError"])
+        self.assertEqual(missing_call["result"]["structuredContent"]["error_type"], "remote_file_error")

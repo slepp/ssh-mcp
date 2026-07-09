@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,10 +27,22 @@ DEFAULT_SESSION_START_WAIT_SECONDS = 1.0
 DEFAULT_SESSION_READ_WAIT_SECONDS = 1.0
 DEFAULT_SESSION_WRITE_WAIT_SECONDS = 1.0
 DEFAULT_SESSION_STOP_WAIT_SECONDS = 2.0
+DEFAULT_VIEW_MAX_BYTES = 20_480  # 20 KiB, matches the local file-viewing tool's cutoff.
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ALLOWED_STRICT_HOST_KEY_CHECKING = {"yes", "no", "ask", "accept-new", "off"}
 _ALLOWED_OBSERVER_MODES = {"transcript", "tmux"}
+_ALLOWED_GREP_OUTPUT_MODES = {"content", "files_with_matches", "count"}
 _EXIT_SIGNAL_NAMES = {9: "killed", 13: "broken-pipe", 15: "terminated"}
+
+# Reserved exit codes used by the small POSIX shell scripts the remote file
+# tools (ssh_view/ssh_create/ssh_edit/ssh_grep/ssh_glob) run over SSH.  Chosen
+# to avoid colliding with common shell/utility exit statuses (0-2, 126, 127, 130).
+_EXIT_NOT_FOUND = 21
+_EXIT_NOT_REGULAR_FILE = 22
+_EXIT_IS_DIRECTORY = 23
+_EXIT_ALREADY_EXISTS = 24
+_EXIT_NO_PARENT_DIR = 25
+_EXIT_NOT_DIRECTORY = 26
 
 
 class SshMcpError(Exception):
@@ -47,6 +59,10 @@ class SessionNotFoundError(SshMcpError):
 
 class ForwardNotFoundError(SshMcpError):
     """Raised when a forward id is unknown."""
+
+
+class RemoteFileError(SshMcpError):
+    """Raised when a remote file/directory operation cannot proceed as requested."""
 
 
 def utcnow() -> datetime:
@@ -521,6 +537,49 @@ def _run_without_pty(argv: list[str], *, timeout: float | None) -> dict[str, Any
     }
 
 
+def _run_without_pty_binary_safe(
+    argv: list[str], *, timeout: float | None, input_text: str | None = None
+) -> dict[str, Any]:
+    """Like ``_run_without_pty``, but preserves file content byte-for-byte.
+
+    ``subprocess.Popen(..., text=True)`` enables Python's universal-newlines
+    translation, which silently rewrites ``\\r\\n`` and lone ``\\r`` to
+    ``\\n`` while reading -- harmless for displaying command output, but
+    silently corrupts CRLF line endings when the remote file tools read a
+    file's exact content and (for ssh_edit) write it straight back. This
+    variant communicates in raw bytes and decodes manually, which performs no
+    newline translation, so it's used for all ssh_view/ssh_create/ssh_edit/
+    ssh_grep/ssh_glob remote script execution.
+    """
+    start = time.monotonic()
+    input_bytes = input_text.encode("utf-8") if input_text is not None else None
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    timed_out = False
+    forced_kill = False
+    try:
+        stdout_bytes, stderr_bytes = process.communicate(input=input_bytes, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        forced_kill = _terminate_process_group(process)
+        stdout_bytes, stderr_bytes = process.communicate()
+    duration_ms = int((time.monotonic() - start) * 1000)
+    exit_code, term_signal = _split_return_code(process.returncode)
+    return {
+        "exit_code": exit_code,
+        "signal": term_signal,
+        "stdout": (stdout_bytes or b"").decode("utf-8", errors="replace"),
+        "stderr": (stderr_bytes or b"").decode("utf-8", errors="replace"),
+        "timed_out": timed_out,
+        "duration_ms": duration_ms,
+    }
+
+
 def _run_with_pty(argv: list[str], *, timeout: float | None) -> dict[str, Any]:
     start = time.monotonic()
     master_fd, slave_fd = os.openpty()
@@ -743,6 +802,332 @@ def _normalize_local_destination(path: str, *, require_directory: bool = False) 
     if not parent.exists():
         raise ValidationError(f"Parent directory for local destination does not exist: {parent}")
     return expanded
+
+
+# ---------------------------------------------------------------------------
+# Remote file tools (ssh_view / ssh_create / ssh_edit / ssh_grep / ssh_glob).
+#
+# These mirror the read/edit/search tools agents already use locally (view,
+# create, edit, grep, glob) but operate on files reached over SSH, so remote
+# editing feels the same as local editing.
+#
+# All *data* (paths, patterns, file content) is passed to the remote shell as
+# positional parameters ($1, $2, ...) or over stdin -- never interpolated
+# into script text -- so script text is fixed and there is no remote-side
+# quoting/injection risk.  The scripts use a private range of exit codes
+# (_EXIT_*, see top of file) to report semantic outcomes (not found, already
+# exists, is a directory, ...) distinctly from a wrapped command's own exit
+# status.
+# ---------------------------------------------------------------------------
+
+
+def _shield_leading_dash(path: str) -> str:
+    """Rewrite a relative path starting with '-' as './-...'.
+
+    BSD tools (e.g. macOS's sed) don't reliably support '--' as an
+    end-of-options marker -- it can be misparsed as a literal filename
+    argument, corrupting exit codes -- so a leading '-' in a relative path is
+    neutralized this way instead of relying on '--'.
+    """
+    if path.startswith("-") and not path.startswith("/"):
+        return f"./{path}"
+    return path
+
+
+def _build_script_command(script: str, args: Sequence[str]) -> str:
+    """Build a remote command string that runs ``script`` under ``sh -c``,
+    passing ``args`` as positional parameters ($1, $2, ...) rather than
+    interpolating them into the script text.
+    """
+    words = [shlex.quote(script), "sh", *(shlex.quote(arg) for arg in args)]
+    return "exec sh -c " + " ".join(words)
+
+
+def _remote_file_error_for_exit(
+    exit_code: int | None, path: str, *, timed_out: bool, stderr: str
+) -> RemoteFileError | None:
+    """Translate a remote file-tool script's outcome into a RemoteFileError, if any."""
+    if timed_out:
+        return RemoteFileError(f"Remote operation on '{path}' timed out.")
+    if exit_code == 0:
+        return None
+    if exit_code == _EXIT_NOT_FOUND:
+        return RemoteFileError(f"Remote path does not exist: {path}")
+    if exit_code == _EXIT_NOT_REGULAR_FILE:
+        return RemoteFileError(f"Remote path exists but is not a regular file: {path}")
+    if exit_code == _EXIT_IS_DIRECTORY:
+        return RemoteFileError(f"Remote path is a directory, not a file: {path}")
+    if exit_code == _EXIT_ALREADY_EXISTS:
+        return RemoteFileError(f"Remote path already exists: {path}")
+    if exit_code == _EXIT_NO_PARENT_DIR:
+        return RemoteFileError(f"Parent directory does not exist remotely for: {path}")
+    if exit_code == _EXIT_NOT_DIRECTORY:
+        return RemoteFileError(f"Remote path exists but is not a directory: {path}")
+    message = stderr.strip() or f"remote command exited with code {exit_code}."
+    return RemoteFileError(f"Remote operation on '{path}' failed: {message}")
+
+
+def _parse_view_range(value: Any) -> tuple[int, int]:
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValidationError("'view_range' must be a two-element array, e.g. [start, end].")
+    start_raw, end_raw = value
+    if isinstance(start_raw, bool) or isinstance(end_raw, bool):
+        raise ValidationError("'view_range' elements must be integers.")
+    try:
+        start = int(start_raw)
+        end = int(end_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("'view_range' elements must be integers.") from exc
+    if start < 1:
+        raise ValidationError("'view_range[0]' (start line) must be >= 1.")
+    if end != -1 and end < start:
+        raise ValidationError("'view_range[1]' (end line) must be -1 (end of file) or >= start line.")
+    return start, end
+
+
+def _edits_argument(arguments: Mapping[str, Any]) -> list[tuple[str, str]]:
+    value = arguments.get("edits")
+    if not isinstance(value, list) or not value:
+        raise ValidationError(
+            "'edits' is required and must be a non-empty array of {old_str, new_str} objects."
+        )
+    parsed: list[tuple[str, str]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            raise ValidationError(f"'edits[{index}]' must be an object with 'old_str' and 'new_str'.")
+        old_str = item.get("old_str")
+        new_str = item.get("new_str")
+        if not isinstance(old_str, str) or not old_str:
+            raise ValidationError(f"'edits[{index}].old_str' is required and must be a non-empty string.")
+        if "\x00" in old_str:
+            raise ValidationError(f"'edits[{index}].old_str' cannot contain NUL bytes.")
+        if not isinstance(new_str, str):
+            raise ValidationError(f"'edits[{index}].new_str' is required and must be a string.")
+        if "\x00" in new_str:
+            raise ValidationError(f"'edits[{index}].new_str' cannot contain NUL bytes.")
+        parsed.append((old_str, new_str))
+    return parsed
+
+
+def _apply_edits(content: str, edits: list[tuple[str, str]]) -> str:
+    """Apply ``edits`` in order, mirroring the local edit tool's semantics:
+    each ``old_str`` must match exactly one location in the content *as it
+    stands after prior edits in this call have been applied*.
+    """
+    updated = content
+    for index, (old_str, new_str) in enumerate(edits):
+        count = updated.count(old_str)
+        if count == 0:
+            raise RemoteFileError(
+                f"'edits[{index}].old_str' was not found in the file "
+                "(checked after applying any earlier edits in this call)."
+            )
+        if count > 1:
+            raise RemoteFileError(
+                f"'edits[{index}].old_str' matches {count} locations in the file; "
+                "it must match exactly one. Include more surrounding context to make it unique."
+            )
+        updated = updated.replace(old_str, new_str, 1)
+    return updated
+
+
+_BRACE_GROUP_RE = re.compile(r"\{([^{}]*)\}")
+
+
+def _expand_braces(pattern: str) -> list[str]:
+    """Expand one level of ``{a,b,c}`` alternation (non-nested) into concrete patterns."""
+    match = _BRACE_GROUP_RE.search(pattern)
+    if match is None:
+        return [pattern]
+    prefix, suffix = pattern[: match.start()], pattern[match.end() :]
+    expanded: list[str] = []
+    for option in match.group(1).split(","):
+        expanded.extend(_expand_braces(prefix + option + suffix))
+    return expanded
+
+
+def _translate_glob_segment(segment: str) -> str:
+    """Translate one path segment (no ``/``) of a glob pattern into a regex fragment.
+
+    Supports ``*`` (any run of characters), ``?`` (single character), and
+    ``[seq]``/``[!seq]``/``[^seq]`` character classes.
+    """
+    chars: list[str] = []
+    i, n = 0, len(segment)
+    while i < n:
+        c = segment[i]
+        if c == "*":
+            chars.append("[^/]*")
+            i += 1
+        elif c == "?":
+            chars.append("[^/]")
+            i += 1
+        elif c == "[":
+            j = i + 1
+            if j < n and segment[j] in "!^":
+                j += 1
+            if j < n and segment[j] == "]":
+                j += 1
+            while j < n and segment[j] != "]":
+                j += 1
+            if j >= n:
+                # Unterminated '[' -- treat as a literal character.
+                chars.append(re.escape("["))
+                i += 1
+            else:
+                inner = segment[i + 1 : j]
+                if inner.startswith("!") or inner.startswith("^"):
+                    inner = "^" + inner[1:]
+                inner = inner.replace("\\", "\\\\")
+                chars.append(f"[{inner}]")
+                i = j + 1
+        else:
+            chars.append(re.escape(c))
+            i += 1
+    return "".join(chars)
+
+
+def glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Compile a shell-style glob pattern to a regex, for use with ``.fullmatch()``.
+
+    Supports the primitives agents expect from the native glob tool: ``*``
+    and ``?`` match within a single path segment, ``[seq]``/``[!seq]`` are
+    character classes, ``{a,b,c}`` is (single-level) alternation, and ``**``
+    matches zero or more whole path segments. A candidate path segment that
+    starts with ``.`` is only matched by a pattern segment that is itself
+    literally dot-prefixed (classic Unix "hidden file" glob behavior).
+    """
+    non_hidden_segment = "[^/.][^/]*"
+    alternatives: list[str] = []
+    for variant in _expand_braces(pattern):
+        segments = variant.split("/")
+        fragments: list[str | None] = []
+        for segment in segments:
+            if segment == "**":
+                fragments.append(None)
+            else:
+                fragment = _translate_glob_segment(segment)
+                if not segment.startswith("."):
+                    fragment = r"(?!\.)" + fragment
+                fragments.append(fragment)
+        pieces: list[str] = []
+        last_index = len(fragments) - 1
+        for index, fragment in enumerate(fragments):
+            previous_is_double_star = index > 0 and fragments[index - 1] is None
+            needs_slash_join = index > 0 and not previous_is_double_star
+            if fragment is None:
+                if needs_slash_join:
+                    pieces.append("/")
+                if index == last_index:
+                    pieces.append(f"(?:{non_hidden_segment}(?:/{non_hidden_segment})*)?")
+                else:
+                    pieces.append(f"(?:{non_hidden_segment}/)*")
+            else:
+                if needs_slash_join:
+                    pieces.append("/")
+                pieces.append(fragment)
+        alternatives.append("".join(pieces))
+    combined = "|".join(f"(?:{alt})" for alt in alternatives)
+    return re.compile(f"(?:{combined})", re.DOTALL)
+
+
+# Matches both grep match lines ("path:line:text") and context lines
+# ("path-line-text"); the backreference requires the same separator on
+# both sides, since a path may itself legitimately contain '-' or ':'.
+_GREP_MATCH_LINE_RE = re.compile(r"\A(?P<path>.*?)(?P<sep>[:-])(?P<line>\d+)(?P=sep)(?P<text>.*)\Z", re.DOTALL)
+
+# $1=path $2=mode('range'|'full'|<auto>) $3=start $4=end(or -1) $5=max_bytes(auto mode)
+_VIEW_SCRIPT = r"""
+P=$1
+MODE=$2
+if [ ! -e "$P" ]; then exit 21; fi
+if [ -d "$P" ]; then
+  printf 'DIR\0'
+  find "$P" -mindepth 1 -maxdepth 2 -name ".*" -prune -o -print 2>/dev/null | sort | while IFS= read -r entry; do
+    if [ -d "$entry" ]; then
+      printf 'd\t%s\n' "$entry"
+    else
+      printf 'f\t%s\n' "$entry"
+    fi
+  done
+  exit 0
+fi
+if [ ! -f "$P" ]; then exit 22; fi
+SIZE=$(wc -c < "$P" | tr -d '[:space:]')
+LINES=$(wc -l < "$P" | tr -d '[:space:]')
+printf 'FILE\t%s\t%s\0' "$SIZE" "$LINES"
+case "$MODE" in
+  range)
+    START=$3
+    END=$4
+    if [ "$END" = "-1" ]; then
+      sed -n "${START},\$p" "$P"
+    else
+      sed -n "${START},${END}p" "$P"
+    fi
+    ;;
+  full)
+    cat "$P"
+    ;;
+  *)
+    MAXB=$5
+    if [ "$SIZE" -gt "$MAXB" ]; then
+      head -c "$MAXB" "$P"
+    else
+      cat "$P"
+    fi
+    ;;
+esac
+"""
+
+# $1=path.  Content is piped over stdin.  Refuses to clobber an existing path
+# or create inside a missing parent directory, mirroring the local create tool.
+_CREATE_SCRIPT = r"""
+P=$1
+if [ -e "$P" ]; then exit 24; fi
+D=$(dirname "$P")
+if [ ! -d "$D" ]; then exit 25; fi
+cat > "$P"
+"""
+
+# $1=path $2=mode('read'|'write').  Used by ssh_edit for both the initial
+# fetch and the write-back; requires the path to already exist as a regular
+# file in both directions.
+_EXISTING_FILE_SCRIPT = r"""
+P=$1
+MODE=$2
+if [ ! -e "$P" ]; then exit 21; fi
+if [ -d "$P" ]; then exit 23; fi
+if [ ! -f "$P" ]; then exit 22; fi
+if [ "$MODE" = "write" ]; then
+  cat > "$P"
+else
+  cat "$P"
+fi
+"""
+
+# args: [path <flags...> -- pattern].  Prefers GNU-compatible PCRE (-P) for
+# closer parity with the regex flavor agents expect, falling back to POSIX
+# ERE (-E) on remotes whose grep doesn't support -P (e.g. macOS/BSD grep).
+_GREP_SCRIPT = r"""
+P=$1
+shift
+if [ ! -e "$P" ]; then exit 21; fi
+GREP=grep
+if command -v ggrep >/dev/null 2>&1; then GREP=ggrep; fi
+if printf 'x' | "$GREP" -P 'x' >/dev/null 2>&1; then FLAG=-P; else FLAG=-E; fi
+exec "$GREP" -r -I -H "$FLAG" --exclude-dir=.git --exclude-dir=.hg --exclude-dir=.svn "$@" "$P"
+"""
+
+# $1=path (a directory).  Enumerates files for ssh_glob; pattern matching
+# against the result happens locally via glob_to_regex().
+_GLOB_SCRIPT = r"""
+P=$1
+if [ ! -e "$P" ]; then exit 21; fi
+if [ ! -d "$P" ]; then exit 26; fi
+cd "$P" || exit 26
+find . -type d \( -name .git -o -name .hg -o -name .svn \) -prune -o -type f -print
+"""
 
 
 @dataclass
@@ -1563,6 +1948,20 @@ class SshToolService:
         self._forwards.close()
         self._sessions.close()
 
+    def _run_remote_script(
+        self,
+        connection: ConnectionSettings,
+        script: str,
+        args: Sequence[str],
+        *,
+        input_text: str | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        ssh_binary = _resolve_ssh_binary(self._configured_ssh_binary)
+        remote_command = _build_script_command(script, args)
+        argv = connection.build_argv(ssh_binary, remote_command, tty=False)
+        return _run_without_pty_binary_safe(argv, timeout=timeout, input_text=input_text)
+
     def ssh_exec(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         validated = _validate_arguments(arguments)
         connection = ConnectionSettings.from_arguments(validated)
@@ -1662,6 +2061,286 @@ class SshToolService:
         result["target"] = connection.target
         result["direction"] = direction
         return result
+
+    def ssh_view(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        validated = _validate_arguments(arguments)
+        connection = ConnectionSettings.from_arguments(validated)
+        path = _string_argument(validated, "path", required=True)
+        force_full = _bool_argument(validated, "force_read_large_files", default=False)
+        max_bytes = _int_argument(
+            validated, "max_bytes", default=DEFAULT_VIEW_MAX_BYTES, minimum=1, allow_zero=False
+        )
+        timeout = _float_argument(validated, "timeout", default=None, minimum=0.0, allow_zero=False)
+        view_range = validated.get("view_range")
+
+        start_line: int | None = None
+        end_line: int | None = None
+        shielded_path = _shield_leading_dash(path)
+        if view_range is not None:
+            start_line, end_line = _parse_view_range(view_range)
+            mode = "range"
+            script_args = [shielded_path, mode, str(start_line), str(end_line), ""]
+        elif force_full:
+            mode = "full"
+            script_args = [shielded_path, mode, "", "", ""]
+        else:
+            mode = "auto"
+            script_args = [shielded_path, mode, "", "", str(max_bytes)]
+
+        result = self._run_remote_script(connection, _VIEW_SCRIPT, script_args, timeout=timeout)
+        error = _remote_file_error_for_exit(
+            result["exit_code"], path, timed_out=result["timed_out"], stderr=result["stderr"]
+        )
+        if error is not None:
+            raise error
+
+        stdout = result["stdout"]
+        separator = stdout.find("\x00")
+        header, payload = (stdout, "") if separator == -1 else (stdout[:separator], stdout[separator + 1 :])
+
+        if header == "DIR":
+            entries: list[dict[str, str]] = []
+            for line in payload.split("\n"):
+                if not line:
+                    continue
+                kind, _, entry_path = line.partition("\t")
+                entries.append({"path": entry_path, "type": "directory" if kind == "d" else "file"})
+            return {
+                "ok": True,
+                "target": connection.target,
+                "path": path,
+                "is_directory": True,
+                "entries": entries,
+            }
+
+        header_parts = header.split("\t")
+        if len(header_parts) != 3 or header_parts[0] != "FILE":
+            raise RemoteFileError(f"Unexpected response reading remote file: {path}")
+        size_bytes = int(header_parts[1])
+        total_lines = int(header_parts[2])
+        truncated = mode == "auto" and size_bytes > max_bytes
+        response: dict[str, Any] = {
+            "ok": True,
+            "target": connection.target,
+            "path": path,
+            "is_directory": False,
+            "content": payload,
+            "size_bytes": size_bytes,
+            "total_lines": total_lines,
+            "truncated": truncated,
+        }
+        if start_line is not None:
+            response["start_line"] = start_line
+            response["end_line"] = end_line
+        return response
+
+    def ssh_create(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        validated = _validate_arguments(arguments)
+        connection = ConnectionSettings.from_arguments(validated)
+        path = _string_argument(validated, "path", required=True)
+        content = arguments.get("content")
+        if not isinstance(content, str):
+            raise ValidationError("'content' is required and must be a string.")
+        if "\x00" in content:
+            raise ValidationError("'content' cannot contain NUL bytes.")
+        timeout = _float_argument(validated, "timeout", default=None, minimum=0.0, allow_zero=False)
+
+        result = self._run_remote_script(
+            connection, _CREATE_SCRIPT, [_shield_leading_dash(path)], input_text=content, timeout=timeout
+        )
+        error = _remote_file_error_for_exit(
+            result["exit_code"], path, timed_out=result["timed_out"], stderr=result["stderr"]
+        )
+        if error is not None:
+            raise error
+        return {
+            "ok": True,
+            "target": connection.target,
+            "path": path,
+            "bytes_written": len(content.encode("utf-8")),
+        }
+
+    def ssh_edit(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        validated = _validate_arguments(arguments)
+        connection = ConnectionSettings.from_arguments(validated)
+        path = _string_argument(validated, "path", required=True)
+        edits = _edits_argument(validated)
+        timeout = _float_argument(validated, "timeout", default=None, minimum=0.0, allow_zero=False)
+        shielded_path = _shield_leading_dash(path)
+
+        read_result = self._run_remote_script(
+            connection, _EXISTING_FILE_SCRIPT, [shielded_path, "read"], timeout=timeout
+        )
+        error = _remote_file_error_for_exit(
+            read_result["exit_code"], path, timed_out=read_result["timed_out"], stderr=read_result["stderr"]
+        )
+        if error is not None:
+            raise error
+
+        updated_content = _apply_edits(read_result["stdout"], edits)
+
+        write_result = self._run_remote_script(
+            connection,
+            _EXISTING_FILE_SCRIPT,
+            [shielded_path, "write"],
+            input_text=updated_content,
+            timeout=timeout,
+        )
+        error = _remote_file_error_for_exit(
+            write_result["exit_code"], path, timed_out=write_result["timed_out"], stderr=write_result["stderr"]
+        )
+        if error is not None:
+            raise error
+
+        return {
+            "ok": True,
+            "target": connection.target,
+            "path": path,
+            "edits_applied": len(edits),
+            "bytes_written": len(updated_content.encode("utf-8")),
+        }
+
+    def ssh_grep(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        validated = _validate_arguments(arguments)
+        connection = ConnectionSettings.from_arguments(validated)
+        pattern = _string_argument(validated, "pattern", required=True, strip=False)
+        path = _string_argument(validated, "path", strip=False) or "."
+        glob_filter = _string_argument(validated, "glob", strip=False)
+        case_insensitive = _bool_argument(validated, "case_insensitive", default=False)
+        output_mode = _string_argument(validated, "output_mode") or "files_with_matches"
+        if output_mode not in _ALLOWED_GREP_OUTPUT_MODES:
+            allowed = ", ".join(sorted(_ALLOWED_GREP_OUTPUT_MODES))
+            raise ValidationError(f"'output_mode' must be one of: {allowed}.")
+        context = _int_argument(validated, "context", default=None, minimum=0)
+        context_before = _int_argument(validated, "context_before", default=0, minimum=0)
+        context_after = _int_argument(validated, "context_after", default=0, minimum=0)
+        if context is not None:
+            context_before = context_after = context
+        if (context_before or context_after) and output_mode != "content":
+            raise ValidationError(
+                "'context'/'context_before'/'context_after' only apply when output_mode is 'content'."
+            )
+        head_limit = _int_argument(validated, "head_limit", default=None, minimum=1, allow_zero=False)
+        timeout = _float_argument(validated, "timeout", default=None, minimum=0.0, allow_zero=False)
+
+        mode_flags: list[str] = []
+        if output_mode == "files_with_matches":
+            mode_flags.append("-l")
+        elif output_mode == "count":
+            mode_flags.append("-c")
+        else:
+            mode_flags.append("-n")
+            if context_before and context_before == context_after:
+                mode_flags.extend(["-C", str(context_before)])
+            else:
+                if context_before:
+                    mode_flags.extend(["-B", str(context_before)])
+                if context_after:
+                    mode_flags.extend(["-A", str(context_after)])
+        case_flags = ["-i"] if case_insensitive else []
+        include_flags: list[str] = []
+        if glob_filter:
+            for variant in _expand_braces(glob_filter):
+                include_flags.extend(["--include", variant])
+
+        script_args = [_shield_leading_dash(path), *mode_flags, *case_flags, *include_flags, "--", pattern]
+        result = self._run_remote_script(connection, _GREP_SCRIPT, script_args, timeout=timeout)
+
+        exit_code = result["exit_code"]
+        if result["timed_out"]:
+            raise RemoteFileError(f"Remote search under '{path}' timed out.")
+        if exit_code == _EXIT_NOT_FOUND:
+            raise RemoteFileError(f"Remote path does not exist: {path}")
+        if exit_code is not None and exit_code > 1:
+            message = result["stderr"].strip() or f"grep exited with code {exit_code}."
+            raise RemoteFileError(f"Remote search under '{path}' failed: {message}")
+
+        lines = result["stdout"].split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+
+        matches: list[Any] = []
+        if output_mode == "files_with_matches":
+            matches = list(lines)
+        elif output_mode == "count":
+            for line in lines:
+                file_path, _, count_str = line.rpartition(":")
+                if not file_path:
+                    continue
+                try:
+                    count = int(count_str)
+                except ValueError:
+                    continue
+                if count > 0:
+                    matches.append({"path": file_path, "count": count})
+        else:
+            for line in lines:
+                found = _GREP_MATCH_LINE_RE.match(line)
+                if found is None:
+                    # Group separator lines (e.g. '--' between context blocks).
+                    continue
+                entry: dict[str, Any] = {
+                    "path": found.group("path"),
+                    "line_number": int(found.group("line")),
+                    "line": found.group("text"),
+                }
+                if found.group("sep") == "-":
+                    entry["is_context"] = True
+                matches.append(entry)
+
+        truncated = False
+        if head_limit is not None and len(matches) > head_limit:
+            matches = matches[:head_limit]
+            truncated = True
+
+        return {
+            "ok": True,
+            "target": connection.target,
+            "pattern": pattern,
+            "path": path,
+            "output_mode": output_mode,
+            "matches": matches,
+            "truncated": truncated,
+        }
+
+    def ssh_glob(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        validated = _validate_arguments(arguments)
+        connection = ConnectionSettings.from_arguments(validated)
+        pattern = _string_argument(validated, "pattern", required=True, strip=False)
+        path = _string_argument(validated, "path", strip=False) or "."
+        head_limit = _int_argument(validated, "head_limit", default=None, minimum=1, allow_zero=False)
+        timeout = _float_argument(validated, "timeout", default=None, minimum=0.0, allow_zero=False)
+
+        result = self._run_remote_script(
+            connection, _GLOB_SCRIPT, [_shield_leading_dash(path)], timeout=timeout
+        )
+        error = _remote_file_error_for_exit(
+            result["exit_code"], path, timed_out=result["timed_out"], stderr=result["stderr"]
+        )
+        if error is not None:
+            raise error
+
+        regex = glob_to_regex(pattern)
+        candidates = (
+            line[2:] if line.startswith("./") else line
+            for line in result["stdout"].split("\n")
+            if line
+        )
+        matched = sorted(candidate for candidate in candidates if regex.fullmatch(candidate))
+
+        truncated = False
+        if head_limit is not None and len(matched) > head_limit:
+            matched = matched[:head_limit]
+            truncated = True
+
+        return {
+            "ok": True,
+            "target": connection.target,
+            "path": path,
+            "pattern": pattern,
+            "matches": matched,
+            "truncated": truncated,
+        }
 
     def _parse_session_arguments(self, arguments: Mapping[str, Any]) -> tuple[
         Mapping[str, Any], ConnectionSettings, str | None, str, bool,

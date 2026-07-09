@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from . import __version__
-from .ssh import ForwardNotFoundError, SessionNotFoundError, SshToolService, ValidationError
+from .ssh import ForwardNotFoundError, RemoteFileError, SessionNotFoundError, SshToolService, ValidationError
 
 SERVER_NAME = "ssh-mcp"
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2024-11-05")
@@ -185,6 +185,182 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "items": {"type": "string"},
                     "description": "Additional rsync flags passed verbatim.",
                 },
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "identity_file": {"type": "string"},
+                "known_hosts_file": {"type": "string"},
+                "strict_host_key_checking": _STRICT_HOST_KEY_CHECKING_SCHEMA,
+                "extra_ssh_args": _EXTRA_SSH_ARGS_SCHEMA,
+            },
+        },
+    },
+    {
+        "name": "ssh_view",
+        "description": (
+            "Read a remote file or list a remote directory over SSH — the remote counterpart "
+            "of the local file-viewing tool. For a file, returns its content plus 'size_bytes' "
+            "and 'total_lines'. Content is truncated at 20KB by default when 'view_range' isn't "
+            "given and 'force_read_large_files' isn't set; use 'view_range' to page through large "
+            "files instead. For a directory, returns non-hidden entries up to 2 levels deep."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["target", "path"],
+            "properties": {
+                "target": {"type": "string", "description": "OpenSSH target such as host, alias, or user@host."},
+                "path": {"type": "string", "description": "Absolute (or login-directory-relative) remote path to a file or directory."},
+                "view_range": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "description": "Optional [start_line, end_line] (1-based, inclusive). Use end_line -1 for 'to end of file'. Bypasses the 20KB truncation cutoff.",
+                },
+                "force_read_large_files": {
+                    "type": "boolean",
+                    "description": "Read the full file even if it exceeds the truncation cutoff. Ignored when 'view_range' is given. Default: false.",
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Truncation cutoff in bytes for the default (no view_range, no force) read. Default: 20480 (20KB).",
+                },
+                "timeout": {"type": "number", "description": "Local timeout in seconds."},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "identity_file": {"type": "string"},
+                "known_hosts_file": {"type": "string"},
+                "strict_host_key_checking": _STRICT_HOST_KEY_CHECKING_SCHEMA,
+                "extra_ssh_args": _EXTRA_SSH_ARGS_SCHEMA,
+            },
+        },
+    },
+    {
+        "name": "ssh_create",
+        "description": (
+            "Create a new remote file over SSH with the given content — the remote counterpart "
+            "of the local file-creation tool. Fails if the path already exists (use ssh_edit to "
+            "modify an existing file) or if the remote parent directory doesn't exist."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["target", "path", "content"],
+            "properties": {
+                "target": {"type": "string", "description": "OpenSSH target such as host, alias, or user@host."},
+                "path": {"type": "string", "description": "Absolute (or login-directory-relative) remote path to create. Must not already exist."},
+                "content": {"type": "string", "description": "Full content to write to the new file."},
+                "timeout": {"type": "number", "description": "Local timeout in seconds."},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "identity_file": {"type": "string"},
+                "known_hosts_file": {"type": "string"},
+                "strict_host_key_checking": _STRICT_HOST_KEY_CHECKING_SCHEMA,
+                "extra_ssh_args": _EXTRA_SSH_ARGS_SCHEMA,
+            },
+        },
+    },
+    {
+        "name": "ssh_edit",
+        "description": (
+            "Replace exact text in an existing remote file over SSH — the remote counterpart of "
+            "the local file-editing tool. Each edit's 'old_str' must match exactly one location "
+            "in the file (as it stands after any earlier edits in the same call); ambiguous or "
+            "missing matches fail without writing anything. Provide multiple {old_str, new_str} "
+            "entries in 'edits' to batch several changes to the same file into a single "
+            "read-then-write round trip instead of one SSH round trip per edit."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["target", "path", "edits"],
+            "properties": {
+                "target": {"type": "string", "description": "OpenSSH target such as host, alias, or user@host."},
+                "path": {"type": "string", "description": "Absolute (or login-directory-relative) remote path. Must already exist as a regular file."},
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["old_str", "new_str"],
+                        "properties": {
+                            "old_str": {
+                                "type": "string",
+                                "description": "Exact text to replace; must match exactly one location (include surrounding context to disambiguate).",
+                            },
+                            "new_str": {"type": "string", "description": "Replacement text."},
+                        },
+                    },
+                    "description": "One or more replacements, applied in order against the file's current remote content.",
+                },
+                "timeout": {"type": "number", "description": "Local timeout in seconds."},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "identity_file": {"type": "string"},
+                "known_hosts_file": {"type": "string"},
+                "strict_host_key_checking": _STRICT_HOST_KEY_CHECKING_SCHEMA,
+                "extra_ssh_args": _EXTRA_SSH_ARGS_SCHEMA,
+            },
+        },
+    },
+    {
+        "name": "ssh_grep",
+        "description": (
+            "Search remote file contents over SSH — the remote counterpart of the local content-"
+            "search tool. Backed by remote grep (PCRE-like -P when available, otherwise POSIX "
+            "extended regex), recursing under 'path' while skipping .git/.hg/.svn. Defaults to "
+            "'files_with_matches' mode for efficiency; use 'content' mode for matching lines with "
+            "line numbers and optional context."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["target", "pattern"],
+            "properties": {
+                "target": {"type": "string", "description": "OpenSSH target such as host, alias, or user@host."},
+                "pattern": {"type": "string", "description": "Regular expression to search for."},
+                "path": {"type": "string", "description": "Remote file or directory to search. Default: '.' (the SSH login directory)."},
+                "glob": {"type": "string", "description": "Glob filter for which filenames to search, e.g. '*.py' or '*.{ts,tsx}'."},
+                "case_insensitive": {"type": "boolean", "description": "Case-insensitive search. Default: false."},
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["content", "files_with_matches", "count"],
+                    "description": (
+                        "'content': matching lines with line numbers (supports context). "
+                        "'files_with_matches': just the matching paths (default). "
+                        "'count': per-file match counts (files with zero matches are omitted)."
+                    ),
+                },
+                "context": {"type": "integer", "minimum": 0, "description": "Lines of context before and after each match. Only applies to output_mode='content'."},
+                "context_before": {"type": "integer", "minimum": 0, "description": "Lines of context before each match. Overridden by 'context' if both are given."},
+                "context_after": {"type": "integer", "minimum": 0, "description": "Lines of context after each match. Overridden by 'context' if both are given."},
+                "head_limit": {"type": "integer", "minimum": 1, "description": "Cap the number of returned matches/files."},
+                "timeout": {"type": "number", "description": "Local timeout in seconds."},
+                "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "identity_file": {"type": "string"},
+                "known_hosts_file": {"type": "string"},
+                "strict_host_key_checking": _STRICT_HOST_KEY_CHECKING_SCHEMA,
+                "extra_ssh_args": _EXTRA_SSH_ARGS_SCHEMA,
+            },
+        },
+    },
+    {
+        "name": "ssh_glob",
+        "description": (
+            "Find remote files by name pattern over SSH — the remote counterpart of the local "
+            "filename-pattern tool. Supports '*', '?', '[seq]'/'[!seq]', '{a,b}' alternation, and "
+            "'**' for matching across multiple path segments (e.g. 'src/**/*.ts'). A path segment "
+            "starting with '.' is only matched by a pattern segment that itself starts with '.'. "
+            "Enumerates under 'path' via remote find, skipping .git/.hg/.svn; matching is done locally."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["target", "pattern"],
+            "properties": {
+                "target": {"type": "string", "description": "OpenSSH target such as host, alias, or user@host."},
+                "pattern": {"type": "string", "description": "Glob pattern to match, relative to 'path', e.g. '**/*.ts' or '*.{ts,tsx}'."},
+                "path": {"type": "string", "description": "Remote base directory to search under. Default: '.' (the SSH login directory)."},
+                "head_limit": {"type": "integer", "minimum": 1, "description": "Cap the number of returned matches."},
+                "timeout": {"type": "number", "description": "Local timeout in seconds."},
                 "port": {"type": "integer", "minimum": 1, "maximum": 65535},
                 "identity_file": {"type": "string"},
                 "known_hosts_file": {"type": "string"},
@@ -465,6 +641,11 @@ class McpServer:
             "ssh_exec": self._tool_service.ssh_exec,
             "ssh_scp": self._tool_service.ssh_scp,
             "ssh_sync": self._tool_service.ssh_sync,
+            "ssh_view": self._tool_service.ssh_view,
+            "ssh_create": self._tool_service.ssh_create,
+            "ssh_edit": self._tool_service.ssh_edit,
+            "ssh_grep": self._tool_service.ssh_grep,
+            "ssh_glob": self._tool_service.ssh_glob,
             "ssh_start_session": self._tool_service.ssh_start_session,
             "ssh_ensure_session": self._tool_service.ssh_ensure_session,
             "ssh_read_session": self._tool_service.ssh_read_session,
@@ -631,6 +812,8 @@ class McpServer:
             return _tool_error(str(exc), error_type="session_not_found")
         except ForwardNotFoundError as exc:
             return _tool_error(str(exc), error_type="forward_not_found")
+        except RemoteFileError as exc:
+            return _tool_error(str(exc), error_type="remote_file_error")
         except Exception as exc:  # pragma: no cover - defensive fallback
             print(traceback.format_exc(), file=sys.stderr, flush=True)
             return _tool_error(f"Internal tool error: {exc}", error_type="internal_error")

@@ -1115,6 +1115,76 @@ class SshToolServiceTests(unittest.TestCase):
         self.assertFalse(observer["tmux_started"])
         self.assertIn("Timed out while closing the tmux observer", observer["warning"])
 
+    def test_stop_tmux_observer_is_serialized_under_concurrency(self) -> None:
+        # Regression test: _reader_loop's finally block and an explicit
+        # ssh_stop_session call both invoke _stop_tmux_observer(). Before the
+        # fix, a second concurrent caller would see "someone else is already
+        # stopping it" and return immediately *without waiting*, so callers
+        # like SshSession.stop() could snapshot a stale ("tmux") observer
+        # state instead of the fully-settled ("transcript") one. This
+        # directly exercises two concurrent _stop_tmux_observer() calls with
+        # an artificially slow kill-session to widen the race window, and
+        # measures each call's own duration -- the bug's signature is one
+        # call returning near-instantly instead of waiting for the other.
+        started = self.service.ssh_start_session({"target": "example", "observer_mode": "tmux"})
+        session = self.service._sessions.get(started["session_id"])
+        tmux_binary = str(self.fake_tmux)
+        tmux_session_name = started["observer"]["tmux_session_name"]
+        original_run = subprocess.run
+        call_count = 0
+        call_count_lock = threading.Lock()
+        kill_session_delay = 0.3
+
+        def slow_kill_session(*args, **kwargs):
+            argv = args[0]
+            if argv[:4] == [tmux_binary, "kill-session", "-t", tmux_session_name]:
+                nonlocal call_count
+                with call_count_lock:
+                    call_count += 1
+                time.sleep(kill_session_delay)
+            return original_run(*args, **kwargs)
+
+        barrier = threading.Barrier(2)
+        durations: list[float] = []
+        durations_lock = threading.Lock()
+        errors: list[Exception] = []
+        errors_lock = threading.Lock()
+
+        def worker() -> None:
+            try:
+                barrier.wait(timeout=2)
+                began = time.monotonic()
+                session._stop_tmux_observer()
+                elapsed = time.monotonic() - began
+                with durations_lock:
+                    durations.append(elapsed)
+            except Exception as exc:  # pragma: no cover - surfaced via assertion
+                with errors_lock:
+                    errors.append(exc)
+
+        with mock.patch("ssh_mcp.ssh.subprocess.run", side_effect=slow_kill_session):
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        # Only one thread should have actually invoked kill-session; the
+        # other must have waited for it rather than racing a duplicate call.
+        self.assertEqual(call_count, 1)
+        # Both calls must take roughly as long as the slow kill-session call.
+        # If either returned near-instantly, it saw "someone else is
+        # stopping it" and returned *without waiting* -- the bug.
+        self.assertEqual(len(durations), 2)
+        self.assertTrue(
+            all(d >= kill_session_delay * 0.8 for d in durations),
+            f"expected both calls to take >= ~{kill_session_delay}s, got {durations}",
+        )
+        observer = session._observer_snapshot()
+        self.assertEqual(observer["mode"], "transcript")
+        self.assertFalse(observer["tmux_started"])
+
     def test_tmux_observer_is_closed_when_session_exits_naturally(self) -> None:
         started = self.service.ssh_start_session({"target": "example", "observer_mode": "tmux"})
         session_id = started["session_id"]

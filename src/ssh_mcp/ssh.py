@@ -1328,7 +1328,7 @@ class SshSession:
         self._configured_tmux_binary = tmux_binary
         self._observer_lock = threading.Lock()
         self._tmux_launch_lock = threading.Lock()
-        self._observer_stopping = False
+        self._tmux_stop_lock = threading.Lock()
         observer_script = Path(__file__).with_name("observe.py").resolve()
         observer_command = shlex.join(
             [sys.executable or "python3", str(observer_script), str(self._transcript_path)]
@@ -1451,58 +1451,61 @@ class SshSession:
 
     def _stop_tmux_observer(self) -> None:
         with self._observer_lock:
-            if self._observer_stopping or not self._observer.tmux_started:
+            if not self._observer.tmux_started:
                 return
-            tmux_binary = self._observer.tmux_binary
-            tmux_session_name = self._observer.tmux_session_name
-            if tmux_binary is None or tmux_session_name is None:
-                self._observer.mode = "transcript"
-                self._observer.tmux_started = False
-                self._observer.tmux_binary = None
-                self._observer.tmux_session_name = None
-                return
-            self._observer_stopping = True
-        try:
-            completed = subprocess.run(
-                [tmux_binary, "kill-session", "-t", tmux_session_name],
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=5,
-            )
-        except OSError as exc:
+        # Serialize stops: _reader_loop's finally block and an explicit
+        # ssh_stop_session call can race to close the same tmux session.
+        # Block here until any in-flight stop finishes (mirrors
+        # ensure_observer_mode's use of _tmux_launch_lock for concurrent
+        # launches) so callers can rely on the observer being fully settled
+        # -- not just "someone else is settling it" -- once this returns.
+        with self._tmux_stop_lock:
             with self._observer_lock:
-                self._observer.warning = (
-                    f"Failed to close the tmux observer: {exc}. The transcript is still available at "
-                    f"{self._transcript_path}."
+                if not self._observer.tmux_started:
+                    return
+                tmux_binary = self._observer.tmux_binary
+                tmux_session_name = self._observer.tmux_session_name
+                if tmux_binary is None or tmux_session_name is None:
+                    self._reset_observer_to_transcript_locked()
+                    return
+            try:
+                completed = subprocess.run(
+                    [tmux_binary, "kill-session", "-t", tmux_session_name],
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=5,
                 )
-                self._reset_observer_to_transcript_locked()
-                self._observer_stopping = False
-            return
-        except subprocess.TimeoutExpired:
-            with self._observer_lock:
-                self._observer.warning = (
-                    "Timed out while closing the tmux observer. "
-                    f"The transcript is still available at {self._transcript_path}."
-                )
-                self._reset_observer_to_transcript_locked()
-                self._observer_stopping = False
-            return
-        stderr_text = (completed.stderr or "").strip()
-        lowered_stderr = stderr_text.lower()
-        session_missing = "can't find session" in lowered_stderr or "no server running" in lowered_stderr
-        with self._observer_lock:
-            self._observer_stopping = False
-            if completed.returncode not in (0,) and not session_missing:
-                suffix = f": {stderr_text}" if stderr_text else "."
-                self._observer.warning = (
-                    "Failed to close the tmux observer"
-                    f"{suffix} The transcript is still available at {self._transcript_path}."
-                )
+            except OSError as exc:
+                with self._observer_lock:
+                    self._observer.warning = (
+                        f"Failed to close the tmux observer: {exc}. The transcript is still available at "
+                        f"{self._transcript_path}."
+                    )
+                    self._reset_observer_to_transcript_locked()
                 return
-            self._reset_observer_to_transcript_locked()
+            except subprocess.TimeoutExpired:
+                with self._observer_lock:
+                    self._observer.warning = (
+                        "Timed out while closing the tmux observer. "
+                        f"The transcript is still available at {self._transcript_path}."
+                    )
+                    self._reset_observer_to_transcript_locked()
+                return
+            stderr_text = (completed.stderr or "").strip()
+            lowered_stderr = stderr_text.lower()
+            session_missing = "can't find session" in lowered_stderr or "no server running" in lowered_stderr
+            with self._observer_lock:
+                if completed.returncode not in (0,) and not session_missing:
+                    suffix = f": {stderr_text}" if stderr_text else "."
+                    self._observer.warning = (
+                        "Failed to close the tmux observer"
+                        f"{suffix} The transcript is still available at {self._transcript_path}."
+                    )
+                    return
+                self._reset_observer_to_transcript_locked()
 
     def _close_master_fd(self) -> None:
         with self._condition:
@@ -1708,10 +1711,13 @@ class SshSession:
             with self._condition:
                 self._update_process_status_locked()
                 self._condition.notify_all()
-        final_output = self.read(wait_seconds=min(wait_seconds, 0.25), max_output_chars=max_output_chars)
-        if not final_output["running"]:
+        if self.process.poll() is not None:
             self._reader.join(timeout=0.1)
+        # Settle the observer (blocking on _reader_loop's own stop attempt if
+        # one is already in flight) *before* snapshotting, so the response
+        # always reflects the final state instead of a pre-stop snapshot.
         self._stop_tmux_observer()
+        final_output = self.read(wait_seconds=min(wait_seconds, 0.25), max_output_chars=max_output_chars)
         final_output["was_running"] = was_running
         final_output["termination_signal"] = termination_signal
         return final_output

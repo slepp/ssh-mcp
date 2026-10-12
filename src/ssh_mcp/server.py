@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 import traceback
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -632,7 +634,19 @@ class McpServer:
         stdin: Any | None = None,
         stdout: Any | None = None,
         tool_service: SshToolService | None = None,
+        max_workers: int = 4,
+        max_pending: int = 16,
     ) -> None:
+        if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
+            raise ValueError("max_workers must be a positive integer")
+        if isinstance(max_pending, bool) or not isinstance(max_pending, int) or max_pending < 0:
+            raise ValueError("max_pending must be a non-negative integer")
+        self._max_workers = max_workers
+        self._capacity = max_workers + max_pending
+        self._write_lock = threading.Lock()
+        self._output_error: Exception | None = None
+        self._requests_lock = threading.RLock()
+        self._requests: dict[Future[Any], tuple[Any, threading.Event]] = {}
         self._stdin = stdin or sys.stdin.buffer
         self._stdout = stdout or sys.stdout.buffer
         self._tool_service = tool_service or SshToolService()
@@ -658,9 +672,12 @@ class McpServer:
         }
 
     def serve(self) -> None:
+        executor = ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="ssh-mcp")
         try:
             while True:
                 line = self._stdin.readline()
+                if self._output_error is not None:
+                    raise self._output_error
                 if not line:
                     break
                 if not line.strip():
@@ -676,11 +693,97 @@ class McpServer:
                         )
                     )
                     continue
+                if (
+                    isinstance(message, dict)
+                    and message.get("jsonrpc") == "2.0"
+                    and message.get("method") == "notifications/cancelled"
+                    and "id" not in message
+                ):
+                    self._cancel_request(message.get("params"))
+                    continue
+                if (
+                    isinstance(message, dict)
+                    and message.get("jsonrpc") == "2.0"
+                    and message.get("method") == "tools/call"
+                    and self._initialized
+                ):
+                    self._submit_tool(executor, message)
+                    continue
                 response = self._handle_message(message)
                 if response is not None:
                     self._write_message(response)
         finally:
-            self._tool_service.close()
+            # Drain accepted work before closing resources: a worker may still
+            # be creating a session or forward. Never close underneath it.
+            try:
+                executor.shutdown(wait=True)
+            finally:
+                self._tool_service.close()
+            if self._output_error is not None:
+                raise self._output_error
+
+    def _submit_tool(self, executor: ThreadPoolExecutor, message: dict[str, Any]) -> None:
+        request_id = message.get("id")
+        if "id" in message and (
+            isinstance(request_id, bool) or not isinstance(request_id, (str, int, float, type(None)))
+        ):
+            self._write_message(_jsonrpc_error(
+                JSONRPC_INVALID_REQUEST, "Invalid request ID.", request_id=None,
+            ))
+            return
+        with self._requests_lock:
+            if any(rid == request_id for rid, _ in self._requests.values()) and "id" in message:
+                self._write_message(_jsonrpc_error(
+                    JSONRPC_INVALID_REQUEST, "Request ID is already in flight.", request_id=request_id,
+                ))
+                return
+            if len(self._requests) >= self._capacity:
+                if "id" in message:
+                    self._write_message(_jsonrpc_error(
+                        -32000, "Server busy: tool request capacity exceeded.", request_id=request_id,
+                    ))
+                return
+            cancelled = threading.Event()
+            future = executor.submit(self._run_tool, message, cancelled)
+            self._requests[future] = (request_id if "id" in message else None, cancelled)
+            future.add_done_callback(self._finish_tool)
+
+    def _run_tool(self, message: dict[str, Any], cancelled: threading.Event) -> dict[str, Any] | None:
+        if cancelled.is_set() or self._output_error is not None:
+            return None
+        return self._handle_message(message)
+
+    def _finish_tool(self, future: Future[Any]) -> None:
+        # Completion and cancellation are serialized, so a cancellation
+        # received before completion cannot race a late response onto stdout.
+        with self._requests_lock:
+            _, cancelled = self._requests.pop(future)
+            if future.cancelled() or cancelled.is_set():
+                return
+            response = future.result()
+            if response is not None:
+                try:
+                    self._write_message(response)
+                except Exception as exc:
+                    # The reader may be waiting on stdin. Stop pending work
+                    # immediately and propagate on its next read/EOF.
+                    self._output_error = exc
+
+    def _cancel_request(self, params: Any) -> None:
+        if not isinstance(params, dict):
+            return
+        request_id = params.get("requestId")
+        if isinstance(request_id, bool) or not isinstance(request_id, (str, int, float)):
+            return
+        with self._requests_lock:
+            for future, (rid, cancelled) in list(self._requests.items()):
+                if rid == request_id:
+                    cancelled.set()
+                    # Keep the slot until the executor dequeues the work.
+                    # Future.cancel() leaves a hidden entry in its unbounded
+                    # queue, allowing repeated submit/cancel to bypass limits.
+                    # Running SSH calls also retain their slot until finished.
+                    break
 
     def _handle_message(self, message: Any) -> dict[str, Any] | None:
         if not isinstance(message, dict):
@@ -820,8 +923,11 @@ class McpServer:
 
     def _write_message(self, message: Mapping[str, Any]) -> None:
         encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        self._stdout.write(encoded + b"\n")
-        self._stdout.flush()
+        with self._write_lock:
+            if self._output_error is not None:
+                raise self._output_error
+            self._stdout.write(encoded + b"\n")
+            self._stdout.flush()
 
 
 class JsonRpcRequestError(Exception):

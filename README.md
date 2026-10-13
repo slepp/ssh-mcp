@@ -1,33 +1,49 @@
 # ssh-mcp
 
-An MCP server that gives AI agents SSH access to remote machines through your local OpenSSH client. It wraps `ssh`, `scp`, and `rsync` so agents can run remote commands, transfer files, maintain persistent shell sessions, set up port forwards, and read/edit/search remote files directly — all using your existing SSH config, keys, and credentials.
+Give your AI coding agent access to remote machines through your local OpenSSH client. ssh-mcp lets agents run commands, transfer and edit files, keep interactive shells open, and create port forwards using your existing SSH config, keys, and credentials.
+
+Run ssh-mcp on the machine where your MCP client runs. Your remote hosts only need SSH access and the usual command-line tools; you don't install an MCP server on them.
 
 ## Why ssh-mcp?
 
 - **Uses your local SSH** — host aliases, `~/.ssh/config`, `ProxyJump`, agent forwarding, and existing credentials all work naturally. No SSH libraries or key management.
 - **Native-feeling remote editing** — `ssh_view`/`ssh_create`/`ssh_edit`/`ssh_grep`/`ssh_glob` mirror the read/edit/search tools agents already use locally, so remote files can be read, searched, and edited exactly like local ones instead of through ad hoc `cat`/`sed`/`grep` commands.
-- **Persistent sessions** — agents can keep a shell open across multiple tool calls, just like a human would. Sessions survive context window resets when you give them a `session_name`.
+- **Persistent sessions** — agents can keep a shell open across multiple tool calls, just like a human would. A stable `session_name` lets an agent find the same session after a context reset, while the MCP server keeps running.
 - **Observable** — every session records a transcript and optionally launches a detached tmux viewer so you can watch what the agent is doing in real time.
 - **Permission-gatable** — port forwarding is a separate tool from command execution, so MCP clients can allow SSH access without allowing port forwards.
-- **Pure Python** — no third-party runtime dependencies. Runs anywhere Python 3.10+ and OpenSSH are available.
+- **Pure Python** — no third-party runtime dependencies. Uses Python 3.10+ and your system's OpenSSH tools.
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.10+ in a POSIX environment, such as macOS or Linux (interactive sessions and `tty` commands need a local PTY)
 - `ssh` and `scp` on PATH (or set `SSH_MCP_SSH_BIN` / `SSH_MCP_SCP_BIN`)
-- `rsync` on PATH (or set `SSH_MCP_RSYNC_BIN`) — only needed for `ssh_sync`
+- `rsync` locally and on the remote host — only needed for `ssh_sync`; set `SSH_MCP_RSYNC_BIN` to override the local executable
 - `grep` and `find` on the **remote** host — needed for `ssh_grep` / `ssh_glob` (present on effectively all POSIX systems)
-- `tmux` — optional, for live session observation
+- `tmux` locally — optional, for live session observation
+
+## Check your SSH connection
+
+First, connect from the machine that will run ssh-mcp. Replace `my-server` with an SSH host alias or `user@hostname`:
+
+```bash
+ssh my-server 'printf "connected\n"'
+```
+
+Verify the host fingerprint if SSH asks, and make sure your key or SSH agent is ready. Start with a host and account whose access you are comfortable giving the agent. ssh-mcp uses that account's permissions for remote commands and file changes.
 
 ## Installation
 
 ### With uv (recommended)
 
+With [uv installed](https://docs.astral.sh/uv/getting-started/installation/), your MCP client can launch ssh-mcp with:
+
 ```bash
 uvx --from slepp-ssh-mcp ssh-mcp
 ```
 
-Or install persistently:
+This runs the `ssh-mcp` command from the `slepp-ssh-mcp` package. Running it directly waits for MCP requests on standard input; there is no interactive prompt.
+
+To install the command persistently:
 
 ```bash
 uv tool install slepp-ssh-mcp
@@ -35,11 +51,18 @@ uv tool install slepp-ssh-mcp
 
 ### With pip
 
+Use a virtual environment:
+
 ```bash
-pip install slepp-ssh-mcp
+python3 -m venv .venv
+.venv/bin/python -m pip install slepp-ssh-mcp
 ```
 
-## Setup
+Set your client's `command` to the absolute path to `.venv/bin/ssh-mcp` and use an empty `args` array. This keeps the server available even when the client starts outside your shell.
+
+## Connect your MCP client
+
+The examples below use `uvx`. If it is not on your client's PATH, use its absolute path as `command`. Add entries to an existing configuration rather than replacing its other servers.
 
 ### Claude Code
 
@@ -67,13 +90,32 @@ Or commit a `.mcp.json` to share with your team:
 codex mcp add ssh-mcp -- uvx --from slepp-ssh-mcp ssh-mcp
 ```
 
-### GitHub Copilot
+### GitHub Copilot CLI
 
-Add to `~/.copilot/mcp-config.json` (or `.vscode/mcp.json` per-project):
+Add to `~/.copilot/mcp-config.json`:
 
 ```json
 {
   "mcpServers": {
+    "ssh-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "slepp-ssh-mcp", "ssh-mcp"],
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+Use `/mcp show ssh-mcp` in Copilot CLI to check the server and its tools. If you authenticate through an SSH agent, add its `SSH_AUTH_SOCK` value to this server's `env` object; Copilot CLI inherits `PATH` automatically, while other environment variables need explicit configuration. See the [Copilot CLI MCP guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers) for tool selection and environment configuration.
+
+### VS Code with GitHub Copilot
+
+Create `.vscode/mcp.json` in your project, using VS Code's top-level `servers` key:
+
+```json
+{
+  "servers": {
     "ssh-mcp": {
       "type": "stdio",
       "command": "uvx",
@@ -83,9 +125,42 @@ Add to `~/.copilot/mcp-config.json` (or `.vscode/mcp.json` per-project):
 }
 ```
 
+Review the configuration before trusting the workspace. Run **MCP: List Servers** from the Command Palette to start `ssh-mcp`, then select its tools in Copilot's agent chat. For a user-wide configuration, run **MCP: Open User Configuration**. See the [VS Code MCP guide](https://code.visualstudio.com/docs/agent-customization/mcp-servers) for configuration options.
+
 ### Generic MCP client
 
-Any stdio MCP client works. Point it at `uvx --from slepp-ssh-mcp ssh-mcp` or at a virtualenv's `ssh-mcp` entrypoint.
+Use a client that supports local stdio servers:
+
+- Command: `uvx`
+- Arguments: `--from`, `slepp-ssh-mcp`, `ssh-mcp` as three separate arguments
+
+For a persistent installation, use the absolute path to the `ssh-mcp` executable with no arguments. The client starts and stops the server process.
+
+## Try your first command
+
+Open your client's MCP tool list and confirm that `ssh_exec` is available. In Claude Code or a Codex session, use `/mcp`; in Copilot CLI, use `/mcp show ssh-mcp`; in VS Code, use **MCP: List Servers**. You can also check Codex's saved server configuration with `codex mcp list`.
+
+Ask your agent:
+
+> Use ssh-mcp to run `pwd` and `uname -a` on `my-server`.
+
+Replace `my-server` with the same target you checked earlier. The corresponding `ssh_exec` arguments are:
+
+```json
+{
+  "target": "my-server",
+  "command": "pwd && uname -a",
+  "timeout": 10
+}
+```
+
+The result includes `stdout`, `stderr`, `exit_code`, and `timed_out`. These examples show tool arguments; your MCP client supplies the JSON-RPC request around them.
+
+### If setup fails
+
+- **Server cannot start:** check that the client can find `uvx` (or your installed `ssh-mcp` executable) and that it runs in an environment with Python 3.10+.
+- **SSH fails or waits for authentication:** repeat the terminal SSH check using the same target and account. Make sure the client process can reach your SSH config, keys, and SSH agent (`SSH_AUTH_SOCK`).
+- **Tools are missing:** check the configuration file's top-level key, then reconnect or restart the server and select its tools in your client.
 
 ## How it works
 
@@ -123,7 +198,7 @@ For multi-step work, open a persistent shell. The agent writes commands and read
 Always use a descriptive `session_name`. It serves three purposes:
 1. The agent can find the same session across multiple tool calls
 2. The tmux observer window gets a human-readable name (e.g., `ssh-mcp-prod-web01-deploy-api`)
-3. A different agent or conversation can recover the session by name
+3. Another conversation connected to the same running server can recover the session by name
 
 **Write a command:**
 
@@ -149,6 +224,7 @@ Always include `\n` to press Enter. Use `\u0003` for Ctrl-C, `\u0004` for Ctrl-D
 Check `pending_output_chars` in the response — if non-zero, call again to drain the buffer.
 
 **Session lifecycle:**
+- Session names and IDs are scoped to the running MCP server and are lost when it restarts. Use `ssh_stop_session` and `ssh_stop_forward` to close sessions and forwards when finished.
 - `ssh_ensure_session` is idempotent — call it at the start of each step
 - Sessions auto-detect dead connections via SSH keepalive (~90 seconds)
 - Response includes `uptime_seconds`, `idle_seconds`, and `exit_reason` for health monitoring

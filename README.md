@@ -444,10 +444,24 @@ ssh-mcp is designed for single-developer use on your own machine. It runs SSH co
 
 All session and forward tools accept standard SSH connection parameters: `port`, `identity_file`, `known_hosts_file`, `strict_host_key_checking`, and `extra_ssh_args`. So do `ssh_view`, `ssh_create`, `ssh_edit`, `ssh_grep`, and `ssh_glob`.
 
+## OpenAI function registration
+
+The MCP tool schemas accept both booleans and strings for
+`strict_host_key_checking`: `true` maps to `yes`, `false` maps to `no`, and
+`yes`, `no`, `ask`, `accept-new`, and `off` select the OpenSSH mode. Omit
+the parameter to use your SSH configuration.
+
+When adapting `tools/list` results to OpenAI function tools, copy each
+`inputSchema` to `parameters` and explicitly set `strict: false`. The schemas
+use supported `anyOf` unions, but preserve optional parameters and arbitrary
+`env` keys. OpenAI strict mode requires every property to be required and
+every object to set `additionalProperties: false`; enabling it directly would
+change those interfaces. See the [OpenAI function-calling guide](https://developers.openai.com/api/docs/guides/function-calling#strict-mode).
+
 ## Development
 
 ```bash
-python3 -m pip install build
+python3 -m pip install build -e ".[test]"
 python3 -m unittest discover -s tests -v
 python3 -m compileall src
 python3 -m build

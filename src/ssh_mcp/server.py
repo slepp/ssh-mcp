@@ -68,7 +68,9 @@ _EXTRA_SSH_ARGS_SCHEMA: dict[str, Any] = {
 
 _STRICT_HOST_KEY_CHECKING_SCHEMA: dict[str, Any] = {
     "description": "Boolean or one of yes, no, ask, accept-new, off.",
-    "oneOf": [{"type": "boolean"}, {"type": "string"}],
+    # OpenAI function schemas support anyOf, but reject oneOf. Keep both
+    # input types so existing boolean callers retain their SSH semantics.
+    "anyOf": [{"type": "boolean"}, {"type": "string"}],
 }
 
 _SESSION_NAME_SCHEMA: dict[str, Any] = {

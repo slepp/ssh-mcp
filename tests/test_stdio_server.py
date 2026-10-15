@@ -62,6 +62,22 @@ class StdioServerTests(unittest.TestCase):
         self.assertTrue(line, "expected a JSON-RPC response line")
         return json.loads(line)
 
+    def test_host_key_modes_through_tool_calls(self) -> None:
+        self._rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        for value in (True, False, "yes", "no", "ask", "accept-new", "off"):
+            with self.subTest(value=value):
+                reply = self._rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "ssh_exec", "arguments": {
+                        "target": "example", "command": "printf hello",
+                        "strict_host_key_checking": value}}})
+                self.assertFalse(reply["result"]["isError"])
+                self.assertEqual(reply["result"]["structuredContent"]["stdout"], "hello")
+        reply = self._rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "ssh_exec", "arguments": {
+                "target": "example", "command": "printf hello",
+                "strict_host_key_checking": "invalid"}}})
+        self.assertTrue(reply["result"]["isError"])
+
     def test_stdio_jsonrpc_round_trip(self) -> None:
         initialize = self._rpc(
             {

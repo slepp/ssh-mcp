@@ -23,6 +23,9 @@ classifiers = [
     "Intended Audience :: Developers",
 ]
 
+[project.optional-dependencies]
+test = ["jsonschema>=4.18,<5", "openai>=1.66,<2", "httpx>=0.27,<1"]
+
 [project.urls]
 Homepage = "https://github.com/slepp/ssh-mcp"
 Repository = "https://github.com/slepp/ssh-mcp"

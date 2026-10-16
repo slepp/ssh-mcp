@@ -1318,6 +1318,7 @@ class SshSession:
         self._eof = False
         self._transcript_path = transcript_path
         self._transcript_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._input_lock = threading.Lock()
         self._transcript_lock = threading.Lock()
         # Restrict transcript permissions — transcripts may contain secrets
         # (sudo passwords, API keys echoed during sessions).
@@ -1669,15 +1670,19 @@ class SshSession:
                 )
             if self._master_closed:
                 raise ValidationError(f"Session '{self.session_id}' is not writable anymore.")
-            master_fd = self._master_fd
+            # Pin this PTY even if the reader closes the original descriptor
+            # while another writer is waiting. Descriptor numbers can be reused
+            # by a newly created session.
+            master_fd = os.dup(self._master_fd)
         bytes_written = 0
         try:
-            buffer = memoryview(payload)
-            while bytes_written < len(buffer):
-                written = os.write(master_fd, buffer[bytes_written:])
-                if written <= 0:
-                    raise OSError(errno.EIO, "short write to PTY")
-                bytes_written += written
+            with self._input_lock:
+                buffer = memoryview(payload)
+                while bytes_written < len(buffer):
+                    written = os.write(master_fd, buffer[bytes_written:])
+                    if written <= 0:
+                        raise OSError(errno.EIO, "short write to PTY")
+                    bytes_written += written
         except OSError as exc:
             with self._condition:
                 self._update_process_status_locked()
@@ -1689,6 +1694,8 @@ class SshSession:
             raise ValidationError(
                 f"Failed to write to session '{self.session_id}': {exc.strerror or exc}"
             ) from exc
+        finally:
+            os.close(master_fd)
         result = self.read(
             wait_seconds=wait_seconds, max_output_chars=max_output_chars, wait_for_new=True,
         )

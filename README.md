@@ -470,3 +470,22 @@ python3 -m build
 ## License
 
 MIT. See `LICENSE`.
+
+### Concurrent requests
+
+Tool calls execute concurrently (default: four workers and up to sixteen
+additional pending calls). Set `SSH_MCP_MAX_WORKERS` to a positive integer and
+`SSH_MCP_MAX_PENDING` to a non-negative integer to adjust these limits.
+When capacity is full, new tool requests receive JSON-RPC error `-32000`
+("Server busy"); retry after an outstanding call completes. Protocol requests
+such as `ping` remain responsive even when all workers are occupied.
+Responses may arrive out of order and must be matched by request ID.
+
+`notifications/cancelled` cancels queued calls and suppresses responses from
+running calls. Running synchronous SSH operations continue to completion (or
+their configured timeout), retaining their worker slot; cancellation does not
+kill remote commands or undo side effects. Use the session stop tools to stop
+tracked sessions. Closing stdin drains accepted calls, then closes tracked
+sessions and forwards. Configure tool timeouts when a finite drain time is
+required. Concurrent operations on the same remote file or session can affect
+one another; sequence dependent calls in the client.
